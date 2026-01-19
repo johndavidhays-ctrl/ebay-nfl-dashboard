@@ -1,38 +1,26 @@
+# app/ebay_browse.py
+
 import requests
 
+BROWSE_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 
-BROWSE_ENDPOINT = "https://api.ebay.com/buy/browse/v1/item_summary/search"
-
-
-def browse_search(token: str, query: str) -> dict:
-    """
-    Broad eBay Browse API search.
-    No category restriction.
-    No condition restriction.
-    No sport restriction.
-    """
-
+def browse_search(token: str, query: str, *, limit: int = 50, offset: int = 0, include_auctions: bool = True):
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
 
+    buying = "AUCTION|FIXED_PRICE" if include_auctions else "FIXED_PRICE"
+
     params = {
         "q": query,
-        "limit": 50,
-        "sort": "price",
+        "limit": str(limit),
+        "offset": str(offset),
+        "filter": f"buyingOptions:{{{buying}}}",
     }
 
-    resp = requests.get(
-        BROWSE_ENDPOINT,
-        headers=headers,
-        params=params,
-        timeout=30,
-    )
-
+    resp = requests.get(BROWSE_SEARCH_URL, headers=headers, params=params, timeout=30)
     print("BROWSE STATUS:", resp.status_code)
-    if resp.status_code != 200:
-        print("BROWSE BODY:", resp.text)
 
     resp.raise_for_status()
-    return resp
+    return resp.json()
