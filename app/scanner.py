@@ -49,4 +49,64 @@ def run():
         resp = browse_search(token, q)
 
         # browse_search returns a Response object
-        if not
+        if not hasattr(resp, "json"):
+            print("SCANNER: browse_search did not return Response")
+            continue
+
+        if resp.status_code != 200:
+            print(f"SCANNER: browse error {resp.status_code}")
+            continue
+
+        data = resp.json()
+        items = data.get("itemSummaries", [])
+
+        print(f"SCANNER: items returned: {len(items)}")
+
+        for item in items:
+            total_seen += 1
+
+            try:
+                price = float(item["price"]["value"])
+                shipping = float(
+                    item.get("shippingOptions", [{}])[0]
+                    .get("shippingCost", {})
+                    .get("value", 0)
+                )
+            except Exception:
+                continue
+
+            profit = estimate_profit(price, shipping)
+
+            if profit < MIN_PROFIT:
+                continue
+
+            total_profitable += 1
+
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO deals
+                        (item_id, title, item_url, sold_url, buy_price, buy_shipping)
+                        VALUES (%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (item_id) DO NOTHING
+                        """,
+                        (
+                            item["itemId"],
+                            item["title"],
+                            item["itemWebUrl"],
+                            sold_url(item["title"]),
+                            price,
+                            shipping,
+                        ),
+                    )
+                    conn.commit()
+                    total_inserted += 1
+
+    print(f"SCANNER: total_seen: {total_seen}")
+    print(f"SCANNER: total_profitable: {total_profitable}")
+    print(f"SCANNER: total_inserted: {total_inserted}")
+
+
+if __name__ == "__main__":
+    run()
