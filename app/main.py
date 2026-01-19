@@ -5,16 +5,16 @@ from app.db import init_db, fetch_deals
 app = FastAPI()
 
 
-def money(x):
+def money(v):
     try:
-        return f"${float(x):,.2f}"
+        return f"${float(v):,.2f}"
     except Exception:
         return "$0.00"
 
 
-def pct(x):
+def pct(v):
     try:
-        return f"{float(x):.0f}%"
+        return f"{float(v):.0f}%"
     except Exception:
         return "0%"
 
@@ -22,59 +22,41 @@ def pct(x):
 @app.get("/", response_class=HTMLResponse)
 def home():
     init_db()
-    deals = fetch_deals(limit=250)
+    deals = fetch_deals()
 
     rows = []
     for d in deals:
-        title = d.get("title", "")
-        listing = d.get("listing_type", "") or ""
-        buy_price = money(d.get("buy_price", 0))
-        ship = money(d.get("buy_shipping", 0))
-        est_profit = money(d.get("est_profit", 0))
-        roi = pct(d.get("roi", 0))
-        score = f"{float(d.get('score', 0)):.2f}"
-
-        item_url = d.get("item_url", "")
-        sold_url = d.get("sold_url", "")
-
-        links = ""
-        if item_url:
-            links += f'<a href="{item_url}" target="_blank">Listing</a>'
-        if sold_url:
-            if links:
-                links += " | "
-            links += f'<a href="{sold_url}" target="_blank">Sold comps</a>'
-
-        rows.append(
-            f"""
+        rows.append(f"""
             <tr>
-                <td>{title}</td>
-                <td>{listing}</td>
-                <td style="text-align:right">{buy_price}</td>
-                <td style="text-align:right">{ship}</td>
-                <td style="text-align:right">{est_profit}</td>
-                <td style="text-align:right">{roi}</td>
-                <td style="text-align:right">{score}</td>
-                <td>{links}</td>
+                <td>{d["title"]}</td>
+                <td>{d["listing_type"]}</td>
+                <td style="text-align:right">{money(d["buy_price"])}</td>
+                <td style="text-align:right">{money(d["buy_shipping"])}</td>
+                <td style="text-align:right">{money(d["est_profit"])}</td>
+                <td style="text-align:right">{pct(d["roi"])}</td>
+                <td style="text-align:right">{float(d["score"]):.2f}</td>
+                <td>
+                    <a href="{d["item_url"]}" target="_blank">Listing</a> |
+                    <a href="{d["sold_url"]}" target="_blank">Sold comps</a>
+                </td>
             </tr>
-            """
-        )
+        """)
 
-    html = f"""
+    return HTMLResponse(f"""
     <html>
       <head>
         <title>Best Opportunities</title>
         <style>
-          body {{ font-family: Arial, sans-serif; padding: 18px; }}
-          table {{ border-collapse: collapse; width: 100%; }}
+          body {{ font-family: Arial; padding: 18px; }}
+          table {{ width: 100%; border-collapse: collapse; }}
           th, td {{ border: 1px solid #ddd; padding: 8px; }}
-          th {{ background: #f4f4f4; text-align: left; }}
+          th {{ background: #f4f4f4; }}
           tr:nth-child(even) {{ background: #fafafa; }}
         </style>
       </head>
       <body>
         <h1>Best Opportunities</h1>
-        <div>Sorted by score, then estimated profit</div>
+        <div>Minimum $20 estimated profit</div>
         <br/>
         <table>
           <thead>
@@ -95,5 +77,4 @@ def home():
         </table>
       </body>
     </html>
-    """
-    return HTMLResponse(content=html)
+    """)
