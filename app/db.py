@@ -2,7 +2,6 @@ import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
@@ -10,16 +9,14 @@ def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
 
-    return psycopg2.connect(
-        DATABASE_URL,
-        sslmode="require",
-    )
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 def init_db():
     """
-    Creates tables and columns if they do not exist.
-    This function is SAFE to run repeatedly.
+    Safe to run every time.
+    Creates table if missing.
+    Adds columns if missing.
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -41,7 +38,6 @@ def init_db():
                 """
             )
 
-            # Ensure newer columns exist even if table already existed
             cur.execute(
                 """
                 ALTER TABLE deals
@@ -56,17 +52,29 @@ def init_db():
         conn.commit()
 
 
-def fetch_best_deals(limit: int = 100):
+def fetch_deals(limit: int = 200):
     """
-    Used by dashboard to show top opportunities
+    This matches what main.py is trying to import.
+    Returns best opportunities.
     """
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT *
+                SELECT
+                    item_id,
+                    title,
+                    item_url,
+                    sold_url,
+                    COALESCE(listing_type, '') AS listing_type,
+                    COALESCE(buy_price, 0) AS buy_price,
+                    COALESCE(buy_shipping, 0) AS buy_shipping,
+                    COALESCE(est_profit, 0) AS est_profit,
+                    COALESCE(roi, 0) AS roi,
+                    COALESCE(score, 0) AS score,
+                    created_at
                 FROM deals
-                WHERE est_profit >= 20
+                WHERE COALESCE(est_profit, 0) >= 20
                 ORDER BY score DESC, est_profit DESC
                 LIMIT %s
                 """,
