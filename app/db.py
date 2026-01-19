@@ -20,19 +20,18 @@ def get_conn():
     try:
         yield conn
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        conn.close()
 
 
 def init_db() -> None:
     """
     Safe to run every time.
-    Creates the table if missing and adds any columns we rely on.
+    Creates table if missing and upgrades schema if it already exists.
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
+
+            # Base table
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS deals (
@@ -41,12 +40,21 @@ def init_db() -> None:
                     item_url TEXT NOT NULL,
                     sold_url TEXT NOT NULL,
                     buy_price NUMERIC NOT NULL,
-                    buy_shipping NUMERIC NOT NULL DEFAULT 0,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    buy_shipping NUMERIC NOT NULL DEFAULT 0
                 );
                 """
             )
 
+            # 🔴 CRITICAL FIX: ensure created_at exists even on old tables
+            cur.execute(
+                """
+                ALTER TABLE deals
+                ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ
+                DEFAULT NOW();
+                """
+            )
+
+            # Profit + ranking fields
             cur.execute(
                 """
                 ALTER TABLE deals
@@ -60,6 +68,7 @@ def init_db() -> None:
                 """
             )
 
+            # Indexes for dashboard sorting
             cur.execute(
                 """
                 CREATE INDEX IF NOT EXISTS deals_score_idx
@@ -80,7 +89,7 @@ def init_db() -> None:
 def fetch_deals(limit: int = 200):
     """
     Used by the dashboard.
-    Returns a list of dict rows, best first.
+    Best opportunities appear first.
     """
     init_db()
 
@@ -112,14 +121,13 @@ def fetch_deals(limit: int = 200):
                 """,
                 (limit,),
             )
-            rows = cur.fetchall()
-            return rows
+            return cur.fetchall()
 
 
 def update_status(item_id: str, status: str) -> None:
     """
-    Used by the dashboard action buttons.
-    Typical statuses: new, watching, bought, passed, sold
+    Called by dashboard buttons.
+    Example statuses: new, watching, bought, passed, sold
     """
     if not item_id:
         return
