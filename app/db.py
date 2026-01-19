@@ -1,14 +1,16 @@
 # app/db.py
 
 import os
-import psycopg2
 from contextlib import contextmanager
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 
 def _database_url() -> str:
-    url = os.environ.get("DATABASE_URL", "").strip()
+    url = (os.environ.get("DATABASE_URL") or "").strip()
     if not url:
-        raise RuntimeError("DATABASE_URL is not set in the environment")
+        raise RuntimeError("DATABASE_URL is not set")
     return url
 
 
@@ -26,8 +28,8 @@ def get_conn():
 
 def init_db() -> None:
     """
-    Ensures the deals table exists and ensures the scoring columns exist.
-    Safe to run every time the scanner starts.
+    Safe to run every time.
+    Creates the table if missing and adds any columns we rely on.
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -51,7 +53,10 @@ def init_db() -> None:
                 ADD COLUMN IF NOT EXISTS est_profit NUMERIC,
                 ADD COLUMN IF NOT EXISTS roi NUMERIC,
                 ADD COLUMN IF NOT EXISTS score NUMERIC,
-                ADD COLUMN IF NOT EXISTS listing_type TEXT;
+                ADD COLUMN IF NOT EXISTS listing_type TEXT,
+                ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'new',
+                ADD COLUMN IF NOT EXISTS fb_pct NUMERIC,
+                ADD COLUMN IF NOT EXISTS fb_score NUMERIC;
                 """
             )
 
@@ -62,4 +67,73 @@ def init_db() -> None:
                 """
             )
 
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS deals_created_at_idx
+                ON deals (created_at DESC);
+                """
+            )
+
+        conn.commit()
+
+
+def fetch_deals(limit: int = 200):
+    """
+    Used by the dashboard.
+    Returns a list of dict rows, best first.
+    """
+    init_db()
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    item_id,
+                    title,
+                    item_url,
+                    sold_url,
+                    buy_price,
+                    buy_shipping,
+                    est_profit,
+                    roi,
+                    score,
+                    listing_type,
+                    status,
+                    fb_pct,
+                    fb_score,
+                    created_at
+                FROM deals
+                ORDER BY
+                    score DESC NULLS LAST,
+                    est_profit DESC NULLS LAST,
+                    created_at DESC
+                LIMIT %s;
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+            return rows
+
+
+def update_status(item_id: str, status: str) -> None:
+    """
+    Used by the dashboard action buttons.
+    Typical statuses: new, watching, bought, passed, sold
+    """
+    if not item_id:
+        return
+
+    init_db()
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE deals
+                SET status = %s
+                WHERE item_id = %s;
+                """,
+                (status, item_id),
+            )
         conn.commit()
