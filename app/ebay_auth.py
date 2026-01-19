@@ -16,7 +16,7 @@ def get_app_token():
         },
         data={
             "grant_type": "client_credentials",
-            "scope": "https://api.ebay.com/oauth/api_scope/buy.browse",
+            "scope": "https://api.ebay.com/oauth/api_scope",
         },
     )
 
