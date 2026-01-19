@@ -1,92 +1,112 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-from app.db import fetch_deals
+from app.db import init_db, fetch_deals
+
 
 app = FastAPI()
 
+
+def _money(x):
+    if x is None:
+        return ""
+    try:
+        return f"${float(x):,.2f}"
+    except Exception:
+        return ""
+
+
+def _pct(x):
+    if x is None:
+        return ""
+    try:
+        return f"{float(x) * 100:.0f}%"
+    except Exception:
+        return ""
+
+
+def _num(x):
+    if x is None:
+        return ""
+    try:
+        return f"{float(x):.1f}"
+    except Exception:
+        return ""
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
-    rows = fetch_deals()
+    init_db()
+    rows = fetch_deals(limit=250)
 
-    html = """
-    <html>
-      <head>
-        <meta charset="utf-8">
-        <title>Card Deals</title>
+    html = []
+    html.append("<html><head><meta charset='utf-8'>")
+    html.append("<title>Best Opportunities</title>")
+    html.append(
+        """
         <style>
           body { font-family: Arial, sans-serif; margin: 24px; }
+          h1 { margin-bottom: 6px; }
+          .sub { color: #555; margin-bottom: 14px; }
           table { border-collapse: collapse; width: 100%; }
           th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
           th { background: #f5f5f5; text-align: left; }
-          tr:hover { background: #fafafa; }
-          .num { text-align: right; white-space: nowrap; }
-          .small { color: #666; font-size: 12px; }
+          td.num, th.num { text-align: right; white-space: nowrap; }
+          td.links { white-space: nowrap; }
+          .muted { color: #777; }
         </style>
-      </head>
-      <body>
-        <h2>Best Opportunities</h2>
-        <div class="small">Sorted by score, then estimated profit</div>
+        """
+    )
+    html.append("</head><body>")
+    html.append("<h1>Best Opportunities</h1>")
+    html.append("<div class='sub'>Sorted by score, then estimated profit</div>")
 
-        <table>
-          <thead>
-            <tr>
-              <th>Title</th>
-              <th>Listing</th>
-              <th class="num">Buy Price</th>
-              <th class="num">Ship</th>
-              <th class="num">Est Profit</th>
-              <th class="num">ROI</th>
-              <th class="num">Score</th>
-              <th>Links</th>
-            </tr>
-          </thead>
-          <tbody>
-    """
-
-    def fnum(x, d=2):
-        if x is None:
-            return ""
-        try:
-            return f"{float(x):.{d}f}"
-        except Exception:
-            return ""
+    html.append("<table>")
+    html.append(
+        """
+        <thead>
+          <tr>
+            <th>Title</th>
+            <th>Listing</th>
+            <th class="num">Buy Price</th>
+            <th class="num">Ship</th>
+            <th class="num">Est Profit</th>
+            <th class="num">ROI</th>
+            <th class="num">Score</th>
+            <th>Links</th>
+          </tr>
+        </thead>
+        <tbody>
+        """
+    )
 
     for r in rows:
-        title = r.get("title", "")
-        item_url = r.get("item_url", "")
-        sold_url = r.get("sold_url", "")
-        listing_type = r.get("listing_type", "")
+        title = (r.get("title") or "").replace("<", "&lt;").replace(">", "&gt;")
+        listing_type = (r.get("listing_type") or "").replace("<", "&lt;").replace(">", "&gt;")
+        item_url = r.get("item_url") or ""
+        sold_url = r.get("sold_url") or ""
 
-        buy_price = r.get("buy_price", 0)
-        buy_shipping = r.get("buy_shipping", 0)
+        html.append("<tr>")
+        html.append(f"<td>{title}</td>")
+        html.append(f"<td class='muted'>{listing_type}</td>")
+        html.append(f"<td class='num'>{_money(r.get('buy_price'))}</td>")
+        html.append(f"<td class='num'>{_money(r.get('buy_shipping'))}</td>")
+        html.append(f"<td class='num'>{_money(r.get('est_profit'))}</td>")
+        html.append(f"<td class='num'>{_pct(r.get('roi'))}</td>")
+        html.append(f"<td class='num'>{_num(r.get('score'))}</td>")
+        html.append(
+            "<td class='links'>"
+            f"<a href='{item_url}' target='_blank'>Listing</a>"
+            " | "
+            f"<a href='{sold_url}' target='_blank'>Sold comps</a>"
+            "</td>"
+        )
+        html.append("</tr>")
 
-        est_profit = r.get("est_profit", None)
-        roi = r.get("roi", None)
-        score = r.get("score", None)
+    html.append("</tbody></table>")
 
-        html += f"""
-          <tr>
-            <td>{title}</td>
-            <td>{listing_type or ""}</td>
-            <td class="num">${fnum(buy_price)}</td>
-            <td class="num">${fnum(buy_shipping)}</td>
-            <td class="num">${fnum(est_profit)}</td>
-            <td class="num">{fnum(roi)}%</td>
-            <td class="num">{fnum(score)}</td>
-            <td>
-              <a href="{item_url}" target="_blank">Listing</a>
-              &nbsp;|&nbsp;
-              <a href="{sold_url}" target="_blank">Sold comps</a>
-            </td>
-          </tr>
-        """
+    if not rows:
+        html.append("<p class='muted'>No rows found yet. Let the scanner run again.</p>")
 
-    html += """
-          </tbody>
-        </table>
-      </body>
-    </html>
-    """
-
-    return html
+    html.append("</body></html>")
+    return HTMLResponse("".join(html))
