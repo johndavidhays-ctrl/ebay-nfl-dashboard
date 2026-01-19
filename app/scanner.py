@@ -1,3 +1,4 @@
+"SCANNER VERSION: PROFIT_25_ALL_SPORTS"
 import urllib.parse
 from app.db import init_db, get_conn
 from app.ebay_auth import get_app_token
