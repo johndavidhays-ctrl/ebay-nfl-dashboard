@@ -19,7 +19,6 @@ def home():
           <td>{r['title']}</td>
           <td>{r['buy_price']}</td>
           <td>{r['buy_shipping']}</td>
-          <td>{r['seller_feedback_percent']}</td>
           <td>{r['seller_feedback_score']}</td>
           <td>{r['status']}</td>
           <td><a href="{r['item_url']}" target="_blank">listing</a></td>
