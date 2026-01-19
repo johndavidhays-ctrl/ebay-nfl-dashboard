@@ -3,7 +3,7 @@ from app.db import init_db, get_conn
 from app.ebay_auth import get_app_token
 from app.ebay_browse import browse_search
 
-SCANNER_VERSION = "PROFIT_25_ALL_SPORTS_V5"
+SCANNER_VERSION = "PROFIT_25_ALL_SPORTS_STABLE"
 
 MIN_PROFIT = 25.0
 SELL_FEE_RATE = 0.15
@@ -34,9 +34,9 @@ def run():
         "PSA graded card",
         "BGS graded card",
         "SGC graded card",
-        "rookie card PSA",
-        "autograph card PSA",
-        "patch card PSA",
+        "rookie PSA card",
+        "autograph PSA card",
+        "patch PSA card"
     ]
 
     total_seen = 0
@@ -48,18 +48,26 @@ def run():
 
         resp = browse_search(token, q)
 
-        # browse_search returns a Response object
-        if not hasattr(resp, "json"):
-            print("SCANNER: browse_search did not return Response")
+        if resp is None:
+            print("SCANNER: browse_search returned None")
             continue
+
+        if not hasattr(resp, "status_code"):
+            print("SCANNER: browse_search returned unexpected object")
+            continue
+
+        print(f"BROWSE STATUS: {resp.status_code}")
 
         if resp.status_code != 200:
-            print(f"SCANNER: browse error {resp.status_code}")
             continue
 
-        data = resp.json()
-        items = data.get("itemSummaries", [])
+        try:
+            data = resp.json()
+        except Exception:
+            print("SCANNER: failed to parse JSON")
+            continue
 
+        items = data.get("itemSummaries", [])
         print(f"SCANNER: items returned: {len(items)}")
 
         for item in items:
