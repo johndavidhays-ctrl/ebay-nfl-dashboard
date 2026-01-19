@@ -19,7 +19,7 @@ services:
     env: python
     schedule: "0 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python app/scanner.py
+    startCommand: python -m app.scanner
     envVars:
       - key: DATABASE_URL
         fromDatabase:
