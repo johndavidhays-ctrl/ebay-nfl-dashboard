@@ -1,160 +1,183 @@
-# app/scanner.py
-
 import os
 import time
+import math
 import random
-from datetime import datetime, timezone
 import requests
+from datetime import datetime, timezone
 
-from app.db import init_db, upsert_deal, mark_all_inactive, prune_inactive
-
-
-SCANNER_VERSION = "AUCTIONS_SINGLES_MINPROFIT150_STABLE_V1"
-
+EBAY_BROWSE_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
-EBAY_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 
-MIN_PROFIT = 150.0
-MAX_AUCTIONS_PER_QUERY = 25
-MAX_COMP_CALLS = 5
+CLIENT_ID = os.environ.get("EBAY_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET")
 
-# Keep this VERY small to avoid bans
-QUERIES = [
-    "psa 10 football auto /10",
-    "psa 10 football auto /25",
-    "psa 10 football 1/1",
+MIN_PROFIT = 150
+MAX_RESULTS = 200
+MAX_BIDS = 6
+MAX_AUCTION_MINUTES = 60
+
+HEADERS_BASE = {
+    "Content-Type": "application/x-www-form-urlencoded",
+}
+
+SEARCH_QUERIES = [
+    "rookie auto /10",
+    "rookie auto /25",
+    "rookie auto /49",
+    "on card auto",
+    "gold prizm /10",
+    "black prizm",
+    "contenders auto",
+    "optic auto",
+    "flawless patch auto",
+    "immaculate auto",
 ]
 
+BAD_KEYWORDS = [
+    "lot",
+    "lots",
+    "binder",
+    "bulk",
+    "repack",
+    "break",
+]
 
-def log(msg: str):
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"{ts} SCANNER: {msg}", flush=True)
+def log(msg):
+    print(f"{datetime.now().strftime('%H:%M:%S')} SCANNER: {msg}", flush=True)
 
-
-def get_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise RuntimeError(f"Missing env var {name}")
-    return v
-
-
-def get_token() -> str:
+def get_token():
     r = requests.post(
         EBAY_OAUTH_URL,
-        auth=(get_env("EBAY_CLIENT_ID"), get_env("EBAY_CLIENT_SECRET")),
+        headers=HEADERS_BASE,
+        auth=(CLIENT_ID, CLIENT_SECRET),
         data={
             "grant_type": "client_credentials",
             "scope": "https://api.ebay.com/oauth/api_scope",
         },
-        timeout=30,
+        timeout=15,
     )
     r.raise_for_status()
     return r.json()["access_token"]
 
+def request_with_backoff(headers, params):
+    for attempt in range(6):
+        r = requests.get(
+            EBAY_BROWSE_SEARCH_URL,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
 
-def ebay_search(token: str, query: str, buying: str, limit: int):
-    headers = {"Authorization": f"Bearer {token}"}
-    params = {
-        "q": query,
-        "limit": limit,
-        "filter": f"buyingOptions:{{{buying}}}",
-        "sort": "endingSoonest",
+        if r.status_code == 200:
+            return r.json()
+
+        if r.status_code in (429, 500, 502, 503):
+            sleep = min(30, (2 ** attempt) + random.uniform(0, 2))
+            log(f"Rate limited. Sleeping {sleep:.1f}s")
+            time.sleep(sleep)
+            continue
+
+        r.raise_for_status()
+
+    raise RuntimeError("eBay request failed after retries")
+
+def ends_within(item):
+    if not item.get("itemEndDate"):
+        return False
+    end = datetime.fromisoformat(item["itemEndDate"].replace("Z", "+00:00"))
+    minutes = (end - datetime.now(timezone.utc)).total_seconds() / 60
+    return 0 < minutes <= MAX_AUCTION_MINUTES
+
+def bad_title(title):
+    t = title.lower()
+    return any(bad in t for bad in BAD_KEYWORDS)
+
+def estimate_market(token, title):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
     }
 
-    r = requests.get(EBAY_SEARCH_URL, headers=headers, params=params, timeout=30)
+    params = {
+        "q": title,
+        "filter": "buyingOptions:{FIXED_PRICE}",
+        "limit": 25,
+    }
 
-    if r.status_code == 429:
-        log("Rate limited by eBay. Ending scan cleanly.")
+    data = request_with_backoff(headers, params)
+    prices = []
+
+    for i in data.get("itemSummaries", []):
+        try:
+            prices.append(float(i["price"]["value"]))
+        except Exception:
+            pass
+
+    if len(prices) < 3:
         return None
 
-    if r.status_code >= 400:
-        log(f"eBay error {r.status_code}. Skipping query.")
-        return []
+    prices.sort()
+    return sum(prices[len(prices)//3:]) / max(1, len(prices[len(prices)//3:]))
 
-    return r.json().get("itemSummaries", [])
-
-
-def price(item):
-    p = item.get("currentBidPrice") or item.get("price") or {}
-    return float(p.get("value", 0.0))
-
-
-def run():
-    log(f"SCANNER VERSION: {SCANNER_VERSION}")
-
-    init_db()
+def scan():
     token = get_token()
 
-    mark_all_inactive()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+    }
 
-    seen = kept = 0
-    comp_calls = 0
+    kept = 0
+    seen = 0
 
-    for q in QUERIES:
+    for q in SEARCH_QUERIES:
         log(f"query: {q}")
-        time.sleep(2)
 
-        auctions = ebay_search(token, q, "AUCTION", MAX_AUCTIONS_PER_QUERY)
-        if auctions is None:
-            break
+        params = {
+            "q": q,
+            "filter": "buyingOptions:{AUCTION}",
+            "sort": "endingSoonest",
+            "limit": MAX_RESULTS,
+        }
 
-        log(f"items returned: {len(auctions)}")
+        data = request_with_backoff(headers, params)
 
-        for a in auctions:
+        for item in data.get("itemSummaries", []):
             seen += 1
-            title = a.get("title", "")
-            if not title or "PSA" not in title.upper():
+
+            title = item.get("title", "")
+            if bad_title(title):
                 continue
 
-            total = price(a)
-            if total <= 0:
+            if not ends_within(item):
                 continue
 
-            if comp_calls >= MAX_COMP_CALLS:
+            bids = item.get("bidCount", 0)
+            if bids > MAX_BIDS:
                 continue
 
-            time.sleep(3)
-            comps = ebay_search(token, title, "FIXED_PRICE", 20)
-            comp_calls += 1
-
-            if not comps:
+            try:
+                current = float(item["price"]["value"])
+            except Exception:
                 continue
 
-            prices = sorted(price(c) for c in comps if price(c) > 0)
-            if len(prices) < 5:
+            market = estimate_market(token, title)
+            if not market:
                 continue
 
-            market = prices[len(prices) // 2]
-            profit = market - total
-
+            profit = market - current
             if profit < MIN_PROFIT:
                 continue
 
             kept += 1
 
-            upsert_deal(
-                {
-                    "item_id": a.get("itemId"),
-                    "title": title,
-                    "url": a.get("itemWebUrl"),
-                    "image_url": (a.get("image") or {}).get("imageUrl"),
-                    "query": q,
-                    "total_cost": total,
-                    "market": market,
-                    "profit": profit,
-                    "ends_at": a.get("itemEndDate"),
-                    "is_active": True,
-                }
-            )
+            log(f"KEEP | ${current:.0f} -> ${market:.0f} | +${profit:.0f}")
+            log(f"     {title}")
 
-        log(f"kept so far: {kept}")
+        time.sleep(3)
 
-    pruned = prune_inactive()
     log(f"seen: {seen}")
     log(f"kept: {kept}")
-    log(f"pruned: {pruned}")
-    log("scan completed cleanly")
-
 
 if __name__ == "__main__":
-    run()
+    scan()
