@@ -1,10 +1,8 @@
 import os
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-
 
 _engine: Engine | None = None
 
@@ -18,16 +16,11 @@ def _get_engine() -> Engine:
     if not db_url:
         raise RuntimeError("DATABASE_URL is missing")
 
-    # Render provides postgres URLs that work fine as is.
     _engine = create_engine(db_url, pool_pre_ping=True)
     return _engine
 
 
 def init_db() -> None:
-    """
-    Creates the deals table if missing, and adds any missing columns.
-    IMPORTANT: No 'id' column. item_id is the primary key.
-    """
     eng = _get_engine()
     with eng.begin() as conn:
         conn.execute(
@@ -51,8 +44,6 @@ def init_db() -> None:
             )
         )
 
-        # If the table already existed from older versions, ensure columns exist.
-        # These are safe no ops if they already exist.
         conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS title TEXT;"))
         conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS url TEXT;"))
         conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS image_url TEXT;"))
@@ -66,65 +57,46 @@ def init_db() -> None:
         conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();"))
 
 
-def fetch_active_deals(limit: int = 200) -> list[dict[str, Any]]:
-    """
-    Returns active deals sorted by ends_at soonest.
-    Also includes minutes_away for the UI.
-    """
+def mark_all_inactive() -> None:
     eng = _get_engine()
-    sql = text(
-        """
-        SELECT
-            item_id,
-            title,
-            url,
-            image_url,
-            query,
-            total_cost,
-            market,
-            profit,
-            ends_at,
-            is_active,
-            created_at,
-            updated_at
-        FROM deals
-        WHERE is_active = TRUE
-        ORDER BY ends_at ASC NULLS LAST
-        LIMIT :limit;
-        """
-    )
-
-    now = datetime.now(timezone.utc)
-
     with eng.begin() as conn:
-        rows = conn.execute(sql, {"limit": int(limit)}).mappings().all()
+        conn.execute(text("UPDATE deals SET is_active = FALSE;"))
 
-    out: list[dict[str, Any]] = []
-    for r in rows:
-        ends_at = r.get("ends_at")
-        minutes_away = None
-        if ends_at is not None:
-            try:
-                delta = ends_at - now
-                minutes_away = int(delta.total_seconds() // 60)
-                if minutes_away < 0:
-                    minutes_away = 0
-            except Exception:
-                minutes_away = None
 
-        out.append(
-            {
-                "item_id": r.get("item_id"),
-                "title": r.get("title"),
-                "url": r.get("url"),
-                "image_url": r.get("image_url"),
-                "query": r.get("query"),
-                "total_cost": float(r.get("total_cost") or 0),
-                "market": float(r.get("market") or 0),
-                "profit": float(r.get("profit") or 0),
-                "ends_at": r.get("ends_at").isoformat() if r.get("ends_at") else None,
-                "minutes_away": minutes_away,
-            }
+def prune_inactive() -> None:
+    eng = _get_engine()
+    with eng.begin() as conn:
+        conn.execute(text("DELETE FROM deals WHERE is_active = FALSE;"))
+
+
+def upsert_deal(deal: dict[str, Any]) -> None:
+    eng = _get_engine()
+    with eng.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO deals (
+                    item_id, title, url, image_url, query,
+                    total_cost, market, profit, ends_at,
+                    is_active, created_at, updated_at
+                )
+                VALUES (
+                    :item_id, :title, :url, :image_url, :query,
+                    :total_cost, :market, :profit, :ends_at,
+                    TRUE, NOW(), NOW()
+                )
+                ON CONFLICT (item_id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    url = EXCLUDED.url,
+                    image_url = EXCLUDED.image_url,
+                    query = EXCLUDED.query,
+                    total_cost = EXCLUDED.total_cost,
+                    market = EXCLUDED.market,
+                    profit = EXCLUDED.profit,
+                    ends_at = EXCLUDED.ends_at,
+                    is_active = TRUE,
+                    updated_at = NOW();
+                """
+            ),
+            deal,
         )
-
-    return out
