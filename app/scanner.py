@@ -1,723 +1,594 @@
-# scanner.py
-# Auction focused deal scanner for sports card singles on eBay
-# Finds mispriced auctions ending soon, scores them, estimates profit using sold comps when possible
-
+# app/scanner.py
 import os
-import re
+import sys
 import time
-import json
 import math
-import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+import json
+import traceback
+from datetime import datetime, timezone, timedelta
 
 import requests
 
 try:
     import psycopg2
-    from psycopg2.extras import execute_values
+    import psycopg2.extras
 except Exception:
     psycopg2 = None
 
 
-logging.basicConfig(level=logging.INFO, format="SCANNER: %(message)s")
-log = logging.getLogger("scanner")
+SCANNER_VERSION = "AUCTIONS_SINGLES_FAST_PROFIT_V1"
 
 
-SCANNER_VERSION = "AUCTIONS_SINGLES_ENDING_SOON_STEALS_V1"
+def log(msg: str) -> None:
+    ts = datetime.now().strftime("%b %d %I:%M:%S %p")
+    print(f"{ts}  SCANNER: {msg}", flush=True)
 
 
-# =========================
-# Tuning knobs
-# =========================
-
-# What you told me you want
-MAX_PRICE_USD = float(os.getenv("MAX_PRICE_USD", "150"))          # focus on cheaper auctions
-MIN_BUY_PRICE_USD = float(os.getenv("MIN_BUY_PRICE_USD", "10"))   # ignore ultra cheap noise
-MAX_ITEM_COUNT_PER_QUERY = int(os.getenv("MAX_ITEM_COUNT_PER_QUERY", "200"))
-
-# Ending soon window
-ENDING_SOON_HOURS = float(os.getenv("ENDING_SOON_HOURS", "48"))
-
-# Profit focus
-MIN_EST_PROFIT_USD = float(os.getenv("MIN_EST_PROFIT_USD", "10"))  # start here, raise to 100 when you want fewer
-MIN_ROI = float(os.getenv("MIN_ROI", "0.8"))                       # 0.8 means 80%+ ROI
-MAX_TOTAL_RESULTS_TO_SAVE = int(os.getenv("MAX_TOTAL_RESULTS_TO_SAVE", "250"))
-
-# Fees model
-EBAY_FEE_RATE = float(os.getenv("EBAY_FEE_RATE", "0.1325"))        # rough blended fee rate
-EBAY_ORDER_FIXED_FEE = float(os.getenv("EBAY_ORDER_FIXED_FEE", "0.30"))
-
-# Market value estimation strategy
-# If sold comps query fails, fallback uses a conservative multiplier based on rarity signals
-FALLBACK_BASE_MULTIPLIER = float(os.getenv("FALLBACK_BASE_MULTIPLIER", "1.6"))
-
-# Search behavior
-COUNTRY = os.getenv("COUNTRY", "US")
-CATEGORY_IDS = os.getenv("CATEGORY_IDS", "")  # optional comma list, leave blank to let query roam
-
-# eBay auth
-EBAY_OAUTH_TOKEN = os.getenv("EBAY_OAUTH_TOKEN", "").strip()
-EBAY_MARKETPLACE_ID = os.getenv("EBAY_MARKETPLACE_ID", "EBAY_US")
-
-# Database
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+def getenv_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    if v is None or v.strip() == "":
+        return default
+    return v.strip()
 
 
-# =========================
-# Queries: use broad, messy, human language queries
-# =========================
-
-DEFAULT_QUERIES = [
-    "sports card",
-    "rookie card",
-    "autograph card",
-    "patch card",
-    "numbered card",
-    "refractor card",
-    "parallel card",
-    "short print card",
-    "ssp",
-    "sp",
-    "silver prizm",
-    "gold /",
-    "color match",
-    "case hit",
-]
-
-# If you want to focus NFL only, set SPORTS_KEYWORDS in env, example: "football,nfl"
-SPORTS_KEYWORDS = [s.strip().lower() for s in os.getenv("SPORTS_KEYWORDS", "").split(",") if s.strip()]
+def getenv_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(v) if v is not None else default
+    except Exception:
+        return default
 
 
-# =========================
-# Helpers
-# =========================
+def getenv_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v is not None else default
+    except Exception:
+        return default
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def safe_float(x: Any, default: float = 0.0) -> float:
+def ebay_headers(oauth_token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {oauth_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def http_get(url: str, headers: dict, params: dict) -> requests.Response:
+    return requests.get(url, headers=headers, params=params, timeout=30)
+
+
+def parse_money(value) -> float:
     try:
-        if x is None:
-            return default
-        return float(x)
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        s = str(value).strip().replace("$", "").replace(",", "")
+        return float(s)
     except Exception:
-        return default
+        return 0.0
 
 
-def parse_iso_dt(s: str) -> Optional[datetime]:
+def safe_get(d: dict, path: str, default=None):
+    cur = d
+    for p in path.split("."):
+        if not isinstance(cur, dict):
+            return default
+        if p not in cur:
+            return default
+        cur = cur[p]
+    return cur
+
+
+def listing_type_from_item(item: dict) -> str:
+    buying = item.get("buyingOptions") or []
+    if "AUCTION" in buying:
+        return "AUCTION"
+    if "FIXED_PRICE" in buying:
+        return "FIXED_PRICE"
+    if "BEST_OFFER" in buying:
+        return "BEST_OFFER"
+    return (buying[0] if buying else "") or ""
+
+
+def extract_prices(item: dict) -> tuple[float, float]:
+    price = parse_money(safe_get(item, "price.value", 0.0))
+    ship = parse_money(safe_get(item, "shippingOptions.0.shippingCost.value", 0.0))
+    return price, ship
+
+
+def end_time_utc(item: dict):
+    t = safe_get(item, "itemEndDate", None) or safe_get(item, "itemEndDateTime", None)
+    if not t:
+        return None
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.fromisoformat(t.replace("Z", "+00:00"))
     except Exception:
         return None
 
 
-def hours_until(dt: datetime) -> float:
-    return (dt - now_utc()).total_seconds() / 3600.0
+def title_text(item: dict) -> str:
+    return (item.get("title") or "").strip()
 
 
-def money_round(x: float) -> float:
-    return float(f"{x:.2f}")
+def seller_feedback_percent(item: dict):
+    v = safe_get(item, "seller.feedbackPercentage", None)
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
 
 
-def title_has_sports_focus(title: str) -> bool:
-    if not SPORTS_KEYWORDS:
-        return True
-    t = title.lower()
-    return any(k in t for k in SPORTS_KEYWORDS)
+def build_queries() -> list[str]:
+    custom = getenv_str("SCAN_QUERIES", "")
+    if custom:
+        return [q.strip() for q in custom.split("|") if q.strip()]
 
-
-def build_filter_for_auctions(max_price: float) -> str:
-    # eBay Browse API filter format
-    # We are targeting auctions and keeping price low
-    # End time filter is not officially supported in all regions, so we filter by end time in code
-    parts = [
-        "buyingOptions:{AUCTION}",
-        f"price:[{MIN_BUY_PRICE_USD}..{max_price}]",
-        "priceCurrency:USD",
-        f"itemLocationCountry:{COUNTRY}",
+    # Default: broad but designed to catch undervalued singles
+    return [
+        "sports card",
+        "rookie card",
+        "autograph card",
+        "numbered card",
+        "refractor card",
+        "parallel card",
+        "short print card",
+        "ssp sports card",
+        "sp sports card",
+        "case hit sports card",
+        "holo rookie card",
     ]
-    return ",".join(parts)
 
 
-def build_headers() -> Dict[str, str]:
-    if not EBAY_OAUTH_TOKEN:
-        raise RuntimeError("Missing EBAY_OAUTH_TOKEN in environment")
-    return {
-        "Authorization": f"Bearer {EBAY_OAUTH_TOKEN}",
-        "Content-Type": "application/json",
-        "X-EBAY-C-MARKETPLACE-ID": EBAY_MARKETPLACE_ID,
+def should_exclude_title(t: str) -> bool:
+    tl = t.lower()
+
+    # Singles only, avoid lots
+    lot_words = [
+        "lot of", "card lot", "lots", "bundle", "collection", "set", "pick your",
+        "you pick", "choose", "bulk", "random", "mystery", "break", "team lot",
+    ]
+    for w in lot_words:
+        if w in tl:
+            return True
+
+    # Avoid obvious non cards
+    non_card = ["pack", "box", "case", "blaster", "hobby", "mega box", "fat pack"]
+    for w in non_card:
+        if w in tl:
+            return True
+
+    return False
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def estimate_fees(sale_price: float) -> float:
+    # Rough all in: ebay final value + payment processing
+    # You can override with EBAY_FEE_RATE
+    fee_rate = getenv_float("EBAY_FEE_RATE", 0.135)
+    return sale_price * fee_rate
+
+
+def compute_profit(
+    buy_price: float,
+    ship_price: float,
+    est_sale: float,
+    out_ship: float,
+) -> tuple[float, float]:
+    cost = buy_price + ship_price
+    fees = estimate_fees(est_sale)
+    profit = est_sale - cost - fees - out_ship
+    roi = 0.0
+    if cost > 0:
+        roi = profit / cost
+    return profit, roi
+
+
+def score_deal(profit: float, roi: float, hours_left: float, feedback_pct, price: float) -> float:
+    # Higher profit and ROI is better, ending sooner is better, low price gets a small bonus
+    # Seller feedback helps reduce junk
+    profit_component = clamp(profit / 200.0, 0.0, 3.0)
+    roi_component = clamp(roi * 2.0, 0.0, 3.0)
+
+    urgency = 0.0
+    if hours_left is not None:
+        urgency = clamp((24.0 - hours_left) / 24.0, 0.0, 1.0) * 1.2
+
+    trust = 0.0
+    if feedback_pct is not None:
+        trust = clamp((feedback_pct - 95.0) / 5.0, 0.0, 1.0) * 0.8
+
+    price_bonus = 0.0
+    if price > 0:
+        price_bonus = clamp((200.0 - price) / 200.0, 0.0, 1.0) * 0.5
+
+    return profit_component + roi_component + urgency + trust + price_bonus
+
+
+def db_connect():
+    db_url = getenv_str("DATABASE_URL", "")
+    if not db_url:
+        return None
+    if psycopg2 is None:
+        raise RuntimeError("DATABASE_URL is set but psycopg2 is not installed. Add psycopg2-binary to requirements.txt.")
+    return psycopg2.connect(db_url)
+
+
+def db_ensure_schema(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS deals (
+            item_id text PRIMARY KEY,
+            title text,
+            listing_url text,
+            sold_comps_url text,
+            listing_type text,
+            buy_price numeric,
+            ship_price numeric,
+            est_sale numeric,
+            est_profit numeric,
+            roi numeric,
+            score numeric,
+            end_time timestamptz,
+            seller_feedback_percent numeric,
+            active boolean DEFAULT TRUE,
+            created_at timestamptz DEFAULT now(),
+            last_seen timestamptz DEFAULT now()
+        );
+        """
+    )
+
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS title text;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS listing_url text;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS sold_comps_url text;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS listing_type text;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS buy_price numeric;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS ship_price numeric;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS est_sale numeric;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS est_profit numeric;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS roi numeric;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS score numeric;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS end_time timestamptz;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS seller_feedback_percent numeric;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS active boolean DEFAULT TRUE;")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();")
+    cur.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS last_seen timestamptz DEFAULT now();")
+
+
+def db_mark_all_inactive(cur):
+    cur.execute("UPDATE deals SET active = FALSE;")
+
+
+def db_upsert_deal(cur, deal: dict):
+    cur.execute(
+        """
+        INSERT INTO deals (
+            item_id, title, listing_url, sold_comps_url, listing_type,
+            buy_price, ship_price, est_sale, est_profit, roi, score,
+            end_time, seller_feedback_percent, active, last_seen
+        )
+        VALUES (
+            %(item_id)s, %(title)s, %(listing_url)s, %(sold_comps_url)s, %(listing_type)s,
+            %(buy_price)s, %(ship_price)s, %(est_sale)s, %(est_profit)s, %(roi)s, %(score)s,
+            %(end_time)s, %(seller_feedback_percent)s, TRUE, now()
+        )
+        ON CONFLICT (item_id) DO UPDATE SET
+            title = EXCLUDED.title,
+            listing_url = EXCLUDED.listing_url,
+            sold_comps_url = EXCLUDED.sold_comps_url,
+            listing_type = EXCLUDED.listing_type,
+            buy_price = EXCLUDED.buy_price,
+            ship_price = EXCLUDED.ship_price,
+            est_sale = EXCLUDED.est_sale,
+            est_profit = EXCLUDED.est_profit,
+            roi = EXCLUDED.roi,
+            score = EXCLUDED.score,
+            end_time = EXCLUDED.end_time,
+            seller_feedback_percent = EXCLUDED.seller_feedback_percent,
+            active = TRUE,
+            last_seen = now();
+        """,
+        deal,
+    )
+
+
+def db_prune_inactive(cur):
+    # Remove anything not seen in the most recent run
+    cur.execute("DELETE FROM deals WHERE active = FALSE;")
+
+
+def sold_comps_url_for(title: str) -> str:
+    # Simple link to ebay sold search page in the browser
+    q = requests.utils.quote(title)
+    return f"https://www.ebay.com/sch/i.html?_nkw={q}&LH_Sold=1&LH_Complete=1"
+
+
+def estimate_sale_price_via_marketplace_insights(token: str, title: str) -> float | None:
+    # This endpoint requires buy.marketplace.insights scope.
+    # If your token does not have it, this will 401 or 403.
+    url = "https://api.ebay.com/buy/marketplace_insights/v1/item_sales/search"
+    params = {
+        "q": title,
+        "limit": "50",
+        "sort": "saleDate",
+        "filter": "soldDate:[now-30d..now]",
     }
+    r = http_get(url, ebay_headers(token), params)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    items = data.get("itemSales") or []
+    prices = []
+    for it in items:
+        p = parse_money(safe_get(it, "price.value", None))
+        if p > 0:
+            prices.append(p)
+    if not prices:
+        return None
+
+    prices.sort()
+    # Use median to reduce outliers
+    mid = len(prices) // 2
+    if len(prices) % 2 == 1:
+        return float(prices[mid])
+    return float((prices[mid - 1] + prices[mid]) / 2.0)
 
 
-def build_search_params(q: str, limit: int, offset: int) -> Dict[str, str]:
+def browse_search(token: str, q: str, limit: int, offset: int, filters: str, sort: str) -> dict | None:
+    url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
     params = {
         "q": q,
         "limit": str(limit),
         "offset": str(offset),
-        "filter": build_filter_for_auctions(MAX_PRICE_USD),
+        "sort": sort,
+        "filter": filters,
     }
-    if CATEGORY_IDS.strip():
-        params["category_ids"] = CATEGORY_IDS.strip()
-    return params
-
-
-def ebay_browse_search(q: str, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
-    url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
-    r = requests.get(url, headers=build_headers(), params=build_search_params(q, limit, offset), timeout=30)
-    if r.status_code >= 400:
-        raise RuntimeError(f"browse search failed {r.status_code}: {r.text[:500]}")
+    r = http_get(url, ebay_headers(token), params)
+    log(f"BROWSE STATUS: {r.status_code}")
+    if r.status_code != 200:
+        try:
+            log(f"BROWSE BODY: {r.text[:500]}")
+        except Exception:
+            pass
+        return None
     return r.json()
 
 
-def ebay_browse_sold_comps(q: str, limit: int = 50) -> Optional[List[Dict[str, Any]]]:
-    """
-    Attempts sold comps using Browse API.
-    Not all accounts have access to sold items filters. If it fails, return None.
-    """
-    url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
-    params = {
-        "q": q,
-        "limit": str(limit),
-        "offset": "0",
-        "filter": f"soldItems,priceCurrency:USD,itemLocationCountry:{COUNTRY}",
-    }
-    if CATEGORY_IDS.strip():
-        params["category_ids"] = CATEGORY_IDS.strip()
-
-    try:
-        r = requests.get(url, headers=build_headers(), params=params, timeout=30)
-        if r.status_code >= 400:
-            return None
-        data = r.json()
-        items = data.get("itemSummaries") or []
-        return items
-    except Exception:
-        return None
-
-
-def extract_price_and_ship(item: Dict[str, Any]) -> Tuple[float, float]:
-    price = 0.0
-    ship = 0.0
-
-    p = item.get("price") or {}
-    price = safe_float(p.get("value"), 0.0)
-
-    s = item.get("shippingOptions") or []
-    if s and isinstance(s, list):
-        # pick the cheapest shipping option if present
-        best = None
-        for opt in s:
-            c = opt.get("shippingCost") or {}
-            v = safe_float(c.get("value"), None)
-            if v is None:
-                continue
-            if best is None or v < best:
-                best = v
-        if best is not None:
-            ship = float(best)
-
-    # sometimes it is in item.get("shippingCost")
-    if ship == 0.0:
-        c = item.get("shippingCost") or {}
-        ship = safe_float(c.get("value"), 0.0)
-
-    return price, ship
-
-
-def extract_end_time(item: Dict[str, Any]) -> Optional[datetime]:
-    # Auctions usually have "itemEndDate" in the browse summary
-    end_s = item.get("itemEndDate") or item.get("itemEndTime") or ""
-    if not end_s:
-        return None
-    return parse_iso_dt(end_s)
-
-
-def extract_bid_count(item: Dict[str, Any]) -> int:
-    bc = item.get("bidCount")
-    try:
-        return int(bc) if bc is not None else 0
-    except Exception:
-        return 0
-
-
-def rarity_signals(title: str) -> Dict[str, Any]:
-    t = title.lower()
-
-    signals = {
-        "auto": 1 if ("auto" in t or "autograph" in t or "on card" in t) else 0,
-        "patch": 1 if ("patch" in t or "jersey" in t or "relic" in t or "game used" in t) else 0,
-        "numbered": 1 if (re.search(r"/\s*\d{1,3}\b", t) is not None or "numbered" in t) else 0,
-        "refractor": 1 if ("refractor" in t or "prizm" in t or "holo" in t) else 0,
-        "short_print": 1 if ("ssp" in t or "sp" in t or "short print" in t) else 0,
-        "color": 1 if ("gold" in t or "orange" in t or "green" in t or "blue" in t or "red" in t) else 0,
-        "case_hit": 1 if ("case hit" in t or "downtown" in t or "kaboom" in t or "genesis" in t) else 0,
-        "rookie": 1 if ("rookie" in t or "rc" in t) else 0,
-        "graded": 1 if ("psa" in t or "bgs" in t or "sgc" in t) else 0,
-    }
-
-    # pull serial like /99
-    serial = None
-    m = re.search(r"/\s*(\d{1,3})\b", t)
-    if m:
-        serial = int(m.group(1))
-    signals["serial"] = serial
-
-    return signals
-
-
-def compute_fallback_multiplier(signals: Dict[str, Any]) -> float:
-    mult = FALLBACK_BASE_MULTIPLIER
-
-    if signals.get("case_hit"):
-        mult += 1.3
-    if signals.get("auto"):
-        mult += 0.6
-    if signals.get("patch"):
-        mult += 0.5
-    if signals.get("short_print"):
-        mult += 0.4
-    if signals.get("refractor"):
-        mult += 0.25
-    if signals.get("color"):
-        mult += 0.15
-    if signals.get("numbered"):
-        mult += 0.35
-    if signals.get("rookie"):
-        mult += 0.2
-
-    serial = signals.get("serial")
-    if isinstance(serial, int) and serial > 0:
-        if serial <= 10:
-            mult += 1.0
-        elif serial <= 25:
-            mult += 0.7
-        elif serial <= 50:
-            mult += 0.45
-        elif serial <= 99:
-            mult += 0.25
-        else:
-            mult += 0.1
-
-    # graded can be less mispriced in auctions, reduce a bit to keep focus on raw steals
-    if signals.get("graded"):
-        mult -= 0.15
-
-    return max(1.1, mult)
-
-
-def estimate_market_value(title: str, buy_price: float, ship: float) -> Tuple[Optional[float], Optional[float], str]:
-    """
-    Returns (market_value, comp_median, method)
-    market_value is what we think it can sell for
-    comp_median is median sold comp if we could fetch it
-    method is "sold_comps" or "fallback"
-    """
-    q = title
-
-    comps = ebay_browse_sold_comps(q, limit=40)
-    prices = []
-    if comps:
-        for it in comps:
-            p = it.get("price") or {}
-            v = safe_float(p.get("value"), None)
-            if v is None:
-                continue
-            if v <= 0:
-                continue
-            prices.append(v)
-
-    if prices:
-        prices.sort()
-        mid = prices[len(prices) // 2]
-        # take a haircut because your listing will not always hit median
-        market = mid * 0.92
-        return money_round(market), money_round(mid), "sold_comps"
-
-    # fallback
-    sig = rarity_signals(title)
-    mult = compute_fallback_multiplier(sig)
-    market = (buy_price + ship) * mult
-    return money_round(market), None, "fallback"
-
-
-def compute_profit_and_roi(market_value: float, buy: float, ship: float) -> Tuple[float, float]:
-    gross = market_value
-    fees = gross * EBAY_FEE_RATE + EBAY_ORDER_FIXED_FEE
-    net = gross - fees
-    cost = buy + ship
-    profit = net - cost
-    roi = profit / cost if cost > 0 else 0.0
-    return money_round(profit), money_round(roi)
-
-
-def compute_score(profit: float, roi: float, hours_left: float, bid_count: int, signals: Dict[str, Any]) -> float:
-    # This score is designed to bubble up auctions that are:
-    # big upside, low competition, ending soon, with rarity signals
-    rarity = (
-        signals.get("case_hit", 0) * 35
-        + signals.get("auto", 0) * 18
-        + signals.get("patch", 0) * 14
-        + signals.get("numbered", 0) * 12
-        + signals.get("short_print", 0) * 10
-        + signals.get("refractor", 0) * 6
-        + signals.get("rookie", 0) * 5
-        + signals.get("color", 0) * 3
-    )
-
-    serial = signals.get("serial")
-    if isinstance(serial, int) and serial > 0:
-        if serial <= 10:
-            rarity += 18
-        elif serial <= 25:
-            rarity += 12
-        elif serial <= 50:
-            rarity += 7
-        elif serial <= 99:
-            rarity += 4
-
-    # lower bids is better
-    competition = max(0.0, 18.0 - min(bid_count, 18))
-
-    # ending sooner is better, but not too soon
-    # up to 48 hours, we give more weight as it gets closer
-    time_factor = 0.0
-    if hours_left <= 0:
-        time_factor = -20.0
-    else:
-        # 48 hours left => small bump, 4 hours left => bigger bump
-        time_factor = max(0.0, 22.0 - (hours_left / (ENDING_SOON_HOURS / 22.0)))
-
-    # Profit dominates, but ROI and signals also matter
-    score = (
-        profit * 0.9
-        + roi * 60.0
-        + rarity
-        + competition
-        + time_factor
-    )
-
-    return float(f"{score:.2f}")
-
-
-def build_links(item: Dict[str, Any]) -> Dict[str, str]:
-    url = item.get("itemWebUrl") or ""
-    sold_search_url = ""
-    if url:
-        sold_search_url = "https://www.ebay.com/sch/i.html?_nkw=" + requests.utils.quote(item.get("title", "")) + "&LH_Sold=1&LH_Complete=1"
-    return {"listing": url, "sold_comps": sold_search_url}
-
-
-def normalize_row(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    title = item.get("title") or ""
-    if not title:
-        return None
-    if not title_has_sports_focus(title):
-        return None
-
-    buy, ship = extract_price_and_ship(item)
-    if buy <= 0:
-        return None
-    if buy < MIN_BUY_PRICE_USD or buy > MAX_PRICE_USD:
-        return None
-
-    end_dt = extract_end_time(item)
-    if not end_dt:
-        return None
-
-    hrs = hours_until(end_dt)
-    if hrs <= 0 or hrs > ENDING_SOON_HOURS:
-        return None
-
-    bid_count = extract_bid_count(item)
-
-    sig = rarity_signals(title)
-
-    market_value, comp_median, method = estimate_market_value(title, buy, ship)
-    if market_value is None or market_value <= 0:
-        return None
-
-    est_profit, roi = compute_profit_and_roi(market_value, buy, ship)
-
-    if est_profit < MIN_EST_PROFIT_USD:
-        return None
-    if roi < MIN_ROI:
-        return None
-
-    score = compute_score(est_profit, roi, hrs, bid_count, sig)
-
-    links = build_links(item)
-
-    # try to detect listing type
-    listing_type = "auction"
-
-    row = {
-        "title": title,
-        "listing_type": listing_type,
-        "buy_price": money_round(buy),
-        "ship": money_round(ship),
-        "market_value": money_round(market_value),
-        "comp_median": money_round(comp_median) if comp_median is not None else None,
-        "est_profit": money_round(est_profit),
-        "roi": money_round(roi),
-        "score": score,
-        "bid_count": bid_count,
-        "end_time": end_dt.isoformat(),
-        "item_id": item.get("itemId"),
-        "item_url": links["listing"],
-        "sold_comps_url": links["sold_comps"],
-        "est_method": method,
-        "signals": sig,
-    }
-    return row
-
-
-# =========================
-# Database helpers
-# =========================
-
-def db_connect():
-    if not DATABASE_URL:
-        return None
-    if psycopg2 is None:
-        raise RuntimeError("psycopg2 not installed but DATABASE_URL is set")
-    return psycopg2.connect(DATABASE_URL)
-
-
-def db_ensure_schema(conn) -> None:
-    # This is defensive: adds the columns you have been working with
-    # and creates the table if it does not exist.
-    ddl = """
-    CREATE TABLE IF NOT EXISTS deals (
-      item_id text PRIMARY KEY,
-      title text,
-      listing_type text,
-      buy_price numeric,
-      ship numeric,
-      market_value numeric,
-      comp_median numeric,
-      est_profit numeric,
-      roi numeric,
-      score numeric,
-      bid_count integer,
-      end_time timestamptz,
-      item_url text,
-      sold_comps_url text,
-      est_method text,
-      signals jsonb,
-      created_at timestamptz DEFAULT now(),
-      updated_at timestamptz DEFAULT now()
-    );
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS listing_type text;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS market_value numeric;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS comp_median numeric;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS est_profit numeric;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS roi numeric;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS score numeric;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS bid_count integer;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS end_time timestamptz;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS item_url text;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS sold_comps_url text;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS est_method text;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS signals jsonb;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS created_at timestamptz;
-
-    ALTER TABLE deals
-      ADD COLUMN IF NOT EXISTS updated_at timestamptz;
-    """
-    with conn.cursor() as cur:
-        cur.execute(ddl)
-    conn.commit()
-
-
-def db_upsert_rows(conn, rows: List[Dict[str, Any]]) -> int:
-    if not rows:
-        return 0
-
-    cols = [
-        "item_id",
-        "title",
-        "listing_type",
-        "buy_price",
-        "ship",
-        "market_value",
-        "comp_median",
-        "est_profit",
-        "roi",
-        "score",
-        "bid_count",
-        "end_time",
-        "item_url",
-        "sold_comps_url",
-        "est_method",
-        "signals",
-        "updated_at",
-    ]
-
-    values = []
-    for r in rows:
-        values.append((
-            r["item_id"],
-            r["title"],
-            r["listing_type"],
-            r["buy_price"],
-            r["ship"],
-            r["market_value"],
-            r["comp_median"],
-            r["est_profit"],
-            r["roi"],
-            r["score"],
-            r["bid_count"],
-            r["end_time"],
-            r["item_url"],
-            r["sold_comps_url"],
-            r["est_method"],
-            json.dumps(r["signals"]),
-            now_utc().isoformat(),
-        ))
-
-    sql = f"""
-      INSERT INTO deals ({",".join(cols)})
-      VALUES %s
-      ON CONFLICT (item_id) DO UPDATE SET
-        title = EXCLUDED.title,
-        listing_type = EXCLUDED.listing_type,
-        buy_price = EXCLUDED.buy_price,
-        ship = EXCLUDED.ship,
-        market_value = EXCLUDED.market_value,
-        comp_median = EXCLUDED.comp_median,
-        est_profit = EXCLUDED.est_profit,
-        roi = EXCLUDED.roi,
-        score = EXCLUDED.score,
-        bid_count = EXCLUDED.bid_count,
-        end_time = EXCLUDED.end_time,
-        item_url = EXCLUDED.item_url,
-        sold_comps_url = EXCLUDED.sold_comps_url,
-        est_method = EXCLUDED.est_method,
-        signals = EXCLUDED.signals,
-        updated_at = EXCLUDED.updated_at
-    """
-
-    with conn.cursor() as cur:
-        execute_values(cur, sql, values, page_size=200)
-    conn.commit()
-    return len(rows)
-
-
-def db_prune_old(conn) -> int:
-    # Remove ended auctions so your list naturally clears itself
-    # This prevents stale results from hanging around
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM deals WHERE end_time IS NOT NULL AND end_time < now();")
-        deleted = cur.rowcount
-    conn.commit()
-    return deleted
-
-
-# =========================
-# Main scan loop
-# =========================
-
 def run():
-    log.info(f"SCANNER VERSION: {SCANNER_VERSION}")
+    log(f"SCANNER VERSION: {SCANNER_VERSION}")
 
-    if not EBAY_OAUTH_TOKEN:
-        raise RuntimeError("Set EBAY_OAUTH_TOKEN in your environment")
+    token = getenv_str("EBAY_OAUTH_TOKEN", "")
+    if not token:
+        raise RuntimeError("EBAY_OAUTH_TOKEN is missing in Render Environment for nfl-card-scanner")
 
-    queries = [q.strip() for q in os.getenv("QUERIES", "").split("|") if q.strip()]
-    if not queries:
-        queries = DEFAULT_QUERIES
+    # Targets
+    max_buy_price = getenv_float("MAX_BUY_PRICE", 150.0)     # focus on cheap auctions
+    min_buy_price = getenv_float("MIN_BUY_PRICE", 10.0)      # avoid junk below 10
+    max_total_price = getenv_float("MAX_TOTAL_PRICE", 200.0) # buy+ship cap
+    max_end_hours = getenv_float("MAX_END_HOURS", 8.0)       # auctions ending soon
+    min_profit = getenv_float("MIN_EST_PROFIT", 100.0)       # your current goal
+    min_profit_floor = getenv_float("MIN_EST_PROFIT_FLOOR", 10.0)  # fallback if you want more volume
+    require_min_profit_floor = getenv_int("REQUIRE_MIN_PROFIT_FLOOR", 1)  # 1 means also keep 10+ profit if it meets rules
+    out_ship = getenv_float("OUTBOUND_SHIP_COST", 5.0)       # what you pay to ship to buyer later
+    max_results_per_query = getenv_int("MAX_ITEMS_PER_QUERY", 200)
+    page_limit = getenv_int("MAX_PAGES_PER_QUERY", 2)        # each page is 200 max
+    region = getenv_str("EBAY_MARKETPLACE_ID", "EBAY_US")
+
+    # Filters
+    end_to = now_utc() + timedelta(hours=max_end_hours)
+    end_from = now_utc()
+
+    # Browse API uses marketplaceId header, but it can also accept via param in some setups.
+    # We will send it via header as well by extending headers at call sites.
+    # For simplicity we keep headers in ebay_headers; Marketplace header is supported.
+    # If your account requires it, set EBAY_MARKETPLACE_ID.
+    base_headers = ebay_headers(token)
+    base_headers["X-EBAY-C-MARKETPLACE-ID"] = region
+
+    conn = None
+    cur = None
+    db_enabled = False
+
+    db_url = getenv_str("DATABASE_URL", "")
+    if db_url:
+        conn = db_connect()
+        conn.autocommit = True
+        cur = conn.cursor()
+        db_ensure_schema(cur)
+        db_mark_all_inactive(cur)
+        db_enabled = True
+        log("db: connected, schema ensured, marked all inactive")
+    else:
+        log("db: DATABASE_URL not set, running without database writes")
+
+    queries = build_queries()
+    log(f"queries: {len(queries)}")
 
     total_seen = 0
-    kept: List[Dict[str, Any]] = []
+    total_kept = 0
+    total_inserted = 0
 
+    # Auction only, singles only, ending soon
+    # Filters reference: buyingOptions and price ranges are supported in Browse search.
+    # endTime filter is supported via itemEndDate for auctions, but syntax varies.
+    # We will still enforce end time in code to be safe.
     for q in queries:
-        log.info(f"query: {q}")
+        log(f"query: {q}")
 
-        offset = 0
-        while offset < MAX_ITEM_COUNT_PER_QUERY:
-            limit = min(50, MAX_ITEM_COUNT_PER_QUERY - offset)
-            data = ebay_browse_search(q, limit=limit, offset=offset)
+        # Auction only, US, sports cards category can be too narrow, we keep broad but enforce title rules
+        filters = [
+            "buyingOptions:{AUCTION}",
+            f"price:[{min_buy_price}..{max_buy_price}]",
+        ]
 
+        # You can optionally filter by condition, but that may hide deals
+        cond = getenv_str("CONDITION_FILTER", "")
+        if cond:
+            filters.append(f"conditions:{{{cond}}}")
+
+        # If you want to restrict to North America shipping:
+        # filters.append("deliveryCountry:US")
+
+        filter_str = ",".join(filters)
+
+        # Best sort for quick flips is typically ending soon
+        sort = "endingSoonest"
+
+        for page in range(page_limit):
+            offset = page * max_results_per_query
+            params = {
+                "q": q,
+                "limit": str(max_results_per_query),
+                "offset": str(offset),
+                "sort": sort,
+                "filter": filter_str,
+            }
+
+            url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+            r = requests.get(url, headers=base_headers, params=params, timeout=30)
+            log(f"BROWSE STATUS: {r.status_code}")
+            if r.status_code != 200:
+                log(f"BROWSE BODY: {r.text[:400]}")
+                break
+
+            data = r.json()
             items = data.get("itemSummaries") or []
+            log(f"items returned: {len(items)}")
+
             if not items:
                 break
 
-            total_seen += len(items)
-
             for item in items:
-                row = normalize_row(item)
-                if row:
-                    kept.append(row)
+                total_seen += 1
 
-            # stop early if we are already flooded
-            if len(kept) >= MAX_TOTAL_RESULTS_TO_SAVE * 2:
-                break
+                title = title_text(item)
+                if not title:
+                    continue
 
-            offset += limit
+                if should_exclude_title(title):
+                    continue
 
-            # gentle pacing
-            time.sleep(0.2)
+                lt = listing_type_from_item(item)
+                if lt != "AUCTION":
+                    continue
 
-        log.info(f"items_seen_so_far: {total_seen}, kept_so_far: {len(kept)}")
+                buy_price, ship_price = extract_prices(item)
+                total_price = buy_price + ship_price
+                if total_price <= 0:
+                    continue
+                if total_price > max_total_price:
+                    continue
 
-        if len(kept) >= MAX_TOTAL_RESULTS_TO_SAVE * 2:
-            break
+                et = end_time_utc(item)
+                if et is None:
+                    continue
+                if et < end_from or et > end_to:
+                    continue
 
-    # sort and cap
-    kept.sort(key=lambda r: (r["score"], r["est_profit"]), reverse=True)
-    kept = kept[:MAX_TOTAL_RESULTS_TO_SAVE]
+                hrs_left = max((et - now_utc()).total_seconds() / 3600.0, 0.0)
 
-    # print summary
-    log.info(f"total_seen: {total_seen}")
-    log.info(f"total_kept: {len(kept)}")
+                fb = seller_feedback_percent(item)
 
-    if DATABASE_URL:
-        conn = db_connect()
-        if conn:
-            db_ensure_schema(conn)
-            pruned = db_prune_old(conn)
-            if pruned:
-                log.info(f"pruned_ended: {pruned}")
-            inserted = db_upsert_rows(conn, kept)
-            log.info(f"upserted: {inserted}")
-            conn.close()
-    else:
-        # no DB configured, dump top results so you can still see output in logs
-        top = kept[:20]
-        log.info("top_results:")
-        for r in top:
-            log.info(f"score={r['score']} profit=${r['est_profit']} roi={int(r['roi']*100)}% buy=${r['buy_price']} ship=${r['ship']} bids={r['bid_count']} ends={r['end_time']} title={r['title'][:120]}")
+                item_id = item.get("itemId") or ""
+                item_web_url = item.get("itemWebUrl") or ""
 
-    return kept
+                if not item_id or not item_web_url:
+                    continue
+
+                # Estimate sale price
+                # Best: marketplace insights median sold
+                # Fallback: simple multiplier based on auction inefficiency signals
+                est_sale = None
+                est_sale = estimate_sale_price_via_marketplace_insights(token, title)
+
+                if est_sale is None:
+                    # Fallback estimate: assume market is somewhat higher than current bid for undervalued auctions
+                    # Conservative: 1.35x for most, 1.6x if title contains scarcity terms
+                    tl = title.lower()
+                    mult = 1.35
+                    scarcity = ["ssp", "sp", "/10", "/25", "/49", "/50", "/75", "/99", "gold", "refractor", "prizm", "select", "optic", "mosaic", "auto", "autograph", "rookie", "rc"]
+                    hit = 0
+                    for w in scarcity:
+                        if w in tl:
+                            hit += 1
+                    if hit >= 3:
+                        mult = 1.6
+                    elif hit == 2:
+                        mult = 1.5
+                    elif hit == 1:
+                        mult = 1.42
+                    est_sale = buy_price * mult
+
+                est_profit, roi = compute_profit(buy_price, ship_price, est_sale, out_ship)
+
+                # Keep rules
+                keep = False
+                if est_profit >= min_profit:
+                    keep = True
+                elif require_min_profit_floor == 1 and est_profit >= min_profit_floor:
+                    # This is your "at least $10 on it" safety net, still respects min buy price
+                    keep = True
+
+                if not keep:
+                    continue
+
+                score = score_deal(est_profit, roi, hrs_left, fb, total_price)
+
+                # Final cap for anything that slips high
+                # If you want a hard cap of 1000 regardless, set MAX_TOTAL_PRICE lower.
+                if buy_price > 1000.0:
+                    continue
+
+                deal = {
+                    "item_id": item_id,
+                    "title": title,
+                    "listing_url": item_web_url,
+                    "sold_comps_url": sold_comps_url_for(title),
+                    "listing_type": lt,
+                    "buy_price": buy_price,
+                    "ship_price": ship_price,
+                    "est_sale": est_sale,
+                    "est_profit": est_profit,
+                    "roi": roi,
+                    "score": score,
+                    "end_time": et,
+                    "seller_feedback_percent": fb,
+                }
+
+                total_kept += 1
+
+                if db_enabled:
+                    db_upsert_deal(cur, deal)
+                    total_inserted += 1
+
+            # Rate limiting friendly pause
+            time.sleep(getenv_float("REQUEST_SLEEP_SECONDS", 0.25))
+
+    if db_enabled:
+        db_prune_inactive(cur)
+        log("db: pruned inactive rows (not seen in latest run)")
+
+    log(f"total_seen: {total_seen}")
+    log(f"total_kept: {total_kept}")
+    log(f"total_inserted: {total_inserted}")
 
 
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except Exception as e:
+        print("SCANNER CRASHED", flush=True)
+        print(str(e), flush=True)
+        traceback.print_exc()
+        raise
