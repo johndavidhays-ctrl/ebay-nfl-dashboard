@@ -20,8 +20,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # Focus settings
 MAX_BUY_PRICE = 1000.0
-MIN_EST_PROFIT = 100.0
-MAX_ITEMS_PER_QUERY = 50
+MAX_ITEMS_PER_QUERY = 200
+MIN_EST_PROFIT = 20.0
 PAUSE_BETWEEN_CALLS_SEC = 0.35
 
 # Include auctions and fixed price
