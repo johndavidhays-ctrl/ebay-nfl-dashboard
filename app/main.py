@@ -1,9 +1,8 @@
-import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.db import fetch_active_deals, init_db
 
@@ -12,16 +11,24 @@ app = FastAPI()
 
 @app.on_event("startup")
 def _startup() -> None:
-    # Never crash the whole web app if db is temporarily unavailable
+    init_db()
+
+
+def minutes_away(ends_at_iso: str | None) -> int | None:
+    if not ends_at_iso:
+        return None
     try:
-        init_db()
-    except Exception as e:
-        print(f"DB init failed: {e}")
+        dt = datetime.fromisoformat(ends_at_iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return max(0, int((dt - now).total_seconds() // 60))
+    except Exception:
+        return None
 
 
-@app.get("/")
-def health() -> Dict[str, Any]:
-    # Always return ok so Render health checks pass
+@app.get("/health")
+def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "nfl card dashboard",
@@ -29,43 +36,86 @@ def health() -> Dict[str, Any]:
     }
 
 
-def _minutes_away(dt: Optional[datetime]) -> Optional[int]:
-    if not dt:
-        return None
-    now = datetime.now(timezone.utc)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    seconds = (dt - now).total_seconds()
-    return int(seconds // 60)
-
-
 @app.get("/deals")
-def deals(
-    limit: int = Query(200, ge=1, le=1000),
-    min_profit: float = Query(0, ge=0),
-) -> JSONResponse:
-    try:
-        data = fetch_active_deals(limit=limit)
-        # filter min profit here too, in case scanner wrote negatives
-        filtered: List[Dict[str, Any]] = []
-        for d in data:
-            profit = d.get("profit")
-            if profit is None:
-                continue
-            try:
-                if float(profit) < float(min_profit):
-                    continue
-            except Exception:
-                continue
+def deals(limit: int = 200) -> JSONResponse:
+    rows = fetch_active_deals(limit=limit)
+    for r in rows:
+        r["minutes_away"] = minutes_away(r.get("ends_at"))
+    rows.sort(key=lambda x: (x["minutes_away"] is None, x["minutes_away"] or 10**9))
+    return JSONResponse(rows)
 
-            ends_at = d.get("ends_at")
-            d["minutes_away"] = _minutes_away(ends_at)
-            filtered.append(d)
 
-        return JSONResponse(filtered)
-    except Exception as e:
-        # Return useful error instead of Internal Server Error page
-        return JSONResponse(
-            status_code=500,
-            content={"error": "failed_to_fetch_deals", "details": str(e)},
+@app.get("/", response_class=HTMLResponse)
+def home() -> HTMLResponse:
+    rows = fetch_active_deals(limit=200)
+    for r in rows:
+        r["minutes_away"] = minutes_away(r.get("ends_at"))
+    rows.sort(key=lambda x: (x["minutes_away"] is None, x["minutes_away"] or 10**9))
+
+    def money(v: float) -> str:
+        return f"${v:,.2f}"
+
+    html_rows = []
+    for r in rows:
+        if r.get("profit", 0) <= 0:
+            continue
+
+        img = ""
+        if r.get("image_url"):
+            img = f"<img src='{r['image_url']}' style='max-height:120px;max-width:90px;border-radius:6px' />"
+
+        link = r.get("title", "view")
+        url = r.get("url") or "#"
+        title_html = f"<a href='{url}' target='_blank' rel='noreferrer'>{link}</a>"
+
+        html_rows.append(
+            f"""
+            <tr>
+                <td style="width:110px">{img}</td>
+                <td>{title_html}<div style="opacity:.7;font-size:12px">{r.get("item_id","")}</div></td>
+                <td style="text-align:right;white-space:nowrap">{money(float(r.get("total_cost",0)))}</td>
+                <td style="text-align:right;white-space:nowrap">{money(float(r.get("market",0)))}</td>
+                <td style="text-align:right;white-space:nowrap;font-weight:700">{money(float(r.get("profit",0)))}</td>
+                <td style="text-align:right;white-space:nowrap">{r.get("minutes_away") if r.get("minutes_away") is not None else ""}</td>
+                <td style="white-space:nowrap">{r.get("query") or ""}</td>
+            </tr>
+            """
         )
+
+    page = f"""
+    <html>
+    <head>
+        <meta charset="utf-8" />
+        <title>Auctions ending soon</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 24px; }}
+            h1 {{ margin: 0 0 8px 0; }}
+            .sub {{ margin: 0 0 16px 0; opacity: .75; }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            th, td {{ border-bottom: 1px solid #ddd; padding: 10px; vertical-align: top; }}
+            th {{ text-align: left; position: sticky; top: 0; background: #fff; }}
+        </style>
+    </head>
+    <body>
+        <h1>Auctions ending soon</h1>
+        <p class="sub">Sorted by minutes away. Only shows positive profit rows.</p>
+        <table>
+            <thead>
+                <tr>
+                    <th>Card</th>
+                    <th></th>
+                    <th>Total</th>
+                    <th>Market</th>
+                    <th>Profit</th>
+                    <th>Minutes</th>
+                    <th>Query</th>
+                </tr>
+            </thead>
+            <tbody>
+                {''.join(html_rows)}
+            </tbody>
+        </table>
+    </body>
+    </html>
+    """
+    return HTMLResponse(page)
