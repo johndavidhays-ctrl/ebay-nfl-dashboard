@@ -1,98 +1,104 @@
 import os
-import json
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from sqlalchemy import (
-    create_engine,
-    String,
-    Integer,
-    Boolean,
-    DateTime,
-    Float,
-    Text,
-    Index,
-    text,
-)
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, select, delete
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 
-def utcnow() -> datetime:
+def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is missing")
-
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine)
 
 
 class Base(DeclarativeBase):
     pass
 
 
-class Item(Base):
-    __tablename__ = "items"
+class Deal(Base):
+    __tablename__ = "deals"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ebay_item_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    item_id: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    title: Mapped[str] = mapped_column(Text)
+    url: Mapped[str] = mapped_column(Text)
+    image_url: Mapped[str] = mapped_column(Text, default="")
+    query: Mapped[str] = mapped_column(String(200), default="")
 
-    title: Mapped[str] = mapped_column(String(512))
-    url: Mapped[str] = mapped_column(String(2048))
-    image_url: Mapped[str] = mapped_column(String(2048))
-
-    lane: Mapped[str] = mapped_column(String(16), default="graded")  # graded or raw
-
-    currency: Mapped[str] = mapped_column(String(8), default="USD")
-    total_price: Mapped[float] = mapped_column(Float, default=0.0)
-    market_value: Mapped[float] = mapped_column(Float, default=0.0)
+    total_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    market: Mapped[float] = mapped_column(Float, default=0.0)
     profit: Mapped[float] = mapped_column(Float, default=0.0)
 
-    end_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    end_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    raw_json: Mapped[str] = mapped_column(Text, default="{}")
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
-    __table_args__ = (
-        Index("idx_items_lane_profit", "lane", "profit"),
-        Index("idx_items_end_time", "end_time"),
-        Index("idx_items_active", "active"),
+def get_engine():
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL is missing in environment")
+    return create_engine(url, pool_pre_ping=True)
+
+
+def init_db():
+    eng = get_engine()
+    Base.metadata.create_all(eng)
+    return eng
+
+
+def mark_all_inactive(session: Session):
+    session.query(Deal).update({Deal.active: False})
+    session.commit()
+
+
+def upsert_deal(session: Session, payload: Dict[str, Any]):
+    item_id = payload["item_id"]
+    existing = session.scalar(select(Deal).where(Deal.item_id == item_id))
+    now = _utcnow()
+
+    if existing:
+        existing.title = payload["title"]
+        existing.url = payload["url"]
+        existing.image_url = payload.get("image_url", "") or ""
+        existing.query = payload.get("query", "") or ""
+        existing.total_cost = float(payload.get("total_cost", 0.0))
+        existing.market = float(payload.get("market", 0.0))
+        existing.profit = float(payload.get("profit", 0.0))
+        existing.end_time = payload.get("end_time")
+        existing.active = True
+        existing.last_seen = now
+    else:
+        d = Deal(
+            item_id=item_id,
+            title=payload["title"],
+            url=payload["url"],
+            image_url=payload.get("image_url", "") or "",
+            query=payload.get("query", "") or "",
+            total_cost=float(payload.get("total_cost", 0.0)),
+            market=float(payload.get("market", 0.0)),
+            profit=float(payload.get("profit", 0.0)),
+            end_time=payload.get("end_time"),
+            active=True,
+            first_seen=now,
+            last_seen=now,
+        )
+        session.add(d)
+
+    session.commit()
+
+
+def prune_inactive(session: Session):
+    session.execute(delete(Deal).where(Deal.active == False))  # noqa: E712
+    session.commit()
+
+
+def fetch_active_deals(session: Session, limit: int = 200) -> List[Deal]:
+    stmt = (
+        select(Deal)
+        .where(Deal.active == True)  # noqa: E712
+        .order_by(Deal.end_time.asc().nullslast(), Deal.profit.desc())
+        .limit(limit)
     )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "ebay_item_id": self.ebay_item_id,
-            "title": self.title,
-            "url": self.url,
-            "image_url": self.image_url,
-            "lane": self.lane,
-            "currency": self.currency,
-            "total_price": float(self.total_price),
-            "market_value": float(self.market_value),
-            "profit": float(self.profit),
-            "end_time": self.end_time.isoformat() if self.end_time else None,
-        }
-
-
-def ensure_schema() -> None:
-    Base.metadata.create_all(bind=engine)
-
-    # Add lane column if an older table exists
-    with engine.begin() as conn:
-        cols = conn.execute(
-            text(
-                """
-                select column_name
-                from information_schema.columns
-                where table_name = 'items'
-                """
-            )
-        ).fetchall()
-        colnames = {c[0] for c in cols}
-        if "lane" not in colnames:
-            conn.execute(text("alter table items add column lane varchar(16) default 'graded'"))
+    return list(session.scalars(stmt).all())
