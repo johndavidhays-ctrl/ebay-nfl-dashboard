@@ -1,548 +1,608 @@
 import os
-import re
 import time
-import math
 import random
+import math
+import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import psycopg2
 
-from app.db import init_db, mark_all_inactive, prune_inactive, upsert_deal
 
+SCANNER_VERSION = "HYBRID_MONEY_MODE_V1"
 
-SCANNER_VERSION = "CHAOS_ALL_DIRECTIONS_V1"
+EBAY_CLIENT_ID = os.getenv("EBAY_CLIENT_ID", "").strip()
+EBAY_CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
-EBAY_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+EBAY_BROWSE_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 
-MARKETPLACE_ID = os.getenv("EBAY_MARKETPLACE_ID", "EBAY_US").strip() or "EBAY_US"
+MIN_PROFIT_USD = 150.0
 
-MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "150"))
-MAX_AUCTION_RESULTS = int(os.getenv("MAX_AUCTION_RESULTS", "60"))
-MAX_FIXED_PRICE_RESULTS = int(os.getenv("MAX_FIXED_PRICE_RESULTS", "35"))
+MAX_AUCTION_RESULTS_PER_QUERY = 80
+MAX_DEALS_TO_SAVE_PER_RUN = 40
 
-# Guardrails for speed and rate limits
-MAX_COMP_CALLS_PER_RUN = int(os.getenv("MAX_COMP_CALLS_PER_RUN", "18"))
-SLEEP_BETWEEN_COMP_CALLS_SEC = float(os.getenv("SLEEP_BETWEEN_COMP_CALLS_SEC", "4"))
-SLEEP_BETWEEN_QUERIES_SEC = float(os.getenv("SLEEP_BETWEEN_QUERIES_SEC", "2"))
+ENDING_WITHIN_MINUTES = 360  # 6 hours
+MINUTES_AWAY_CUTOFF = 360
 
-# Keep only auctions ending soon, this is where quick flips happen
-MAX_ENDS_WITHIN_MINUTES = int(os.getenv("MAX_ENDS_WITHIN_MINUTES", "90"))
+COMP_FIXED_PRICE_LIMIT = 25
+MAX_COMP_LOOKUPS_PER_RUN = 35  # keeps API usage sane
 
-# Keep only listings with low attention
-MAX_BID_COUNT = int(os.getenv("MAX_BID_COUNT", "6"))
+SLEEP_BETWEEN_REQUESTS_SEC = 0.65  # quiet scanning
+REQUEST_TIMEOUT_SEC = 20
 
-# Profit model, conservative
-FEE_RATE = float(os.getenv("FEE_RATE", "0.1325"))
-FIXED_FEE = float(os.getenv("FIXED_FEE", "0.30"))
-MARKET_HAIRCUT = float(os.getenv("MARKET_HAIRCUT", "0.92"))
-
-# If you want to cap buy price to avoid tying up cash
-MAX_TOTAL_COST = float(os.getenv("MAX_TOTAL_COST", "800"))
-
-# Optional sports trading cards category id
-# Leave empty for broader scanning including miscategorized listings
-CATEGORY_IDS = os.getenv("EBAY_CATEGORY_IDS", "").strip()
+USER_AGENT = "nfl-card-scanner/1.0"
 
 
-BAD_TITLE_WORDS = [
+BLOCK_TITLE_SUBSTRINGS = [
     "lot",
     "lots",
     "binder",
-    "collection",
+    "binders",
     "bulk",
-    "repack",
-    "break",
-    "breaks",
-    "mystery",
-    "you pick",
-    "you choose",
-    "random",
     "pack",
     "packs",
+    "hobby box",
     "blaster",
-    "box",
+    "break",
+    "breaks",
+    "team set",
+    "complete set",
     "case",
-    "team lot",
-    "player lot",
-    "base lot",
-    "commons",
+    "random",
+    "mystery",
+    "replica",
+    "reprint",
 ]
 
-GOOD_SIGNAL_WORDS = [
-    "auto",
-    "autograph",
-    "on card",
-    "rookie auto",
-    "rc auto",
-    "patch",
-    "rpa",
-    "logo",
-    "shield",
-    "laundry",
-    "tag",
-    "booklet",
-    "one of one",
-    "1/1",
-    "ssp",
-    "case hit",
-    "gold",
-    "black",
-    "red",
-    "blue",
-    "green",
-    "pink",
-    "orange",
-    "silver",
-    "refractor",
-    "prizm",
-    "optic",
-    "select",
-    "contenders",
-    "flawless",
-    "immaculate",
-    "national treasures",
-    "nt",
-    "downtown",
-    "kaboom",
-    "color blast",
-]
-
-# Misspelling bait. These show up underbid all the time.
-MISSPELL_QUERIES = [
-    "jamarr chase auto",
-    "jamar chase auto",
-    "cj stroud rookie",
-    "stroud cj rookie",
-    "pat mahomes prizm",
-    "pattrick mahomes prizm",
-    "justin jeffersons auto",
-    "jefferson justin auto",
-    "brock purdy rooky",
-    "anthony richardson rooky auto",
-]
-
-# Core money searches. Raw and graded both allowed.
-CORE_QUERIES = [
+# Queries designed for mispriced singles and short prints without hammering the obvious PSA lanes
+AUCTION_QUERIES = [
     "rookie auto /10",
-    "rookie auto /25",
-    "rookie auto /49",
-    "rookie auto /99",
-    "on card auto /25",
+    "rookie autograph /10",
+    "ssp rookie auto",
+    "case hit rookie",
+    "gold vinyl 1/1",
+    "black finite 1/1",
+    "true black 1/1",
+    "gold shimmer /10",
     "gold prizm /10",
-    "black prizm 1/1",
-    "contenders auto",
-    "optic auto",
-    "flawless patch auto",
-    "immaculate auto",
-    "national treasures rpa",
-    "downtown",
-    "kaboom",
-    "color blast",
+    "gold wave /10",
+    "blue shimmer /25",
+    "gold /10 rookie",
+    "on card auto /99 rookie",
+    "no huddle ssp",
+    "downtown rookie",
+    "kaboom rookie",
 ]
 
-# Odd category angle. These are narrower so we can search without category filter.
-MISCAT_QUERIES = [
-    "football auto /10",
-    "basketball auto /10",
-    "rookie autograph /25",
-    "prizm /10",
-    "1/1 auto",
+# Used to estimate market using fixed price listings
+COMP_QUERY_TWEAKS = [
+    "",  # keep as is
+    " psa",
+    " bgs",
+    " sgc",
 ]
 
-STOP_WORDS = {
-    "hot", "rare", "nice", "great", "awesome", "mint", "gem", "mt",
-    "card", "cards", "rc", "rookie", "auto", "autograph", "on", "carded",
-    "the", "a", "an", "of", "and", "with", "for", "to", "by",
-}
+
+@dataclass
+class Deal:
+    item_id: str
+    title: str
+    url: str
+    image_url: str
+    query: str
+    total_cost: float
+    market: float
+    profit: float
+    ends_at: Optional[datetime]
+    minutes_away: Optional[int]
 
 
 def log(msg: str) -> None:
     print(f"SCANNER: {msg}", flush=True)
 
 
-def env_required(name: str) -> str:
-    v = os.getenv(name, "").strip()
-    if not v:
-        raise RuntimeError(f"Missing environment variable: {name}")
-    return v
-
-
-def now_utc() -> datetime:
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def parse_iso(dt_str: Optional[str]) -> Optional[datetime]:
-    if not dt_str:
+def parse_ebay_time(s: Optional[str]) -> Optional[datetime]:
+    if not s:
         return None
     try:
-        if dt_str.endswith("Z"):
-            dt_str = dt_str[:-1] + "+00:00"
-        return datetime.fromisoformat(dt_str).astimezone(timezone.utc)
+        # eBay returns ISO 8601, usually with Z
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
     except Exception:
         return None
 
 
-def minutes_away(dt: Optional[datetime]) -> Optional[int]:
+def minutes_until(dt: Optional[datetime]) -> Optional[int]:
     if not dt:
         return None
-    mins = int((dt - now_utc()).total_seconds() // 60)
-    return mins
+    diff = (dt - utc_now()).total_seconds()
+    return int(math.floor(diff / 60))
 
 
-def money_value(obj: Optional[Dict[str, Any]]) -> float:
-    if not obj:
-        return 0.0
-    try:
-        return float(obj.get("value", 0.0))
-    except Exception:
-        return 0.0
-
-
-def item_bid_count(item: Dict[str, Any]) -> int:
-    try:
-        return int(item.get("bidCount") or 0)
-    except Exception:
-        return 0
-
-
-def is_bad_title(title: str) -> bool:
-    t = (title or "").lower()
-    if re.search(r"\b\d+\s*cards?\b", t):
-        return True
-    for w in BAD_TITLE_WORDS:
-        if w in t:
+def is_blocked_title(title: str) -> bool:
+    t = title.lower()
+    for sub in BLOCK_TITLE_SUBSTRINGS:
+        if sub in t:
             return True
     return False
 
 
-def has_good_signals(title: str) -> bool:
-    t = (title or "").lower()
-    if "/1" in t or "1/1" in t:
-        return True
-    if re.search(r"\b/\s*\d{1,4}\b", t):
-        return True
-    if re.search(r"\b\d{1,4}\s*/\s*\d{1,4}\b", t):
-        return True
-    for w in GOOD_SIGNAL_WORDS:
-        if w in t:
-            return True
-    return False
+def get_access_token() -> str:
+    if not EBAY_CLIENT_ID or not EBAY_CLIENT_SECRET:
+        raise RuntimeError("Missing EBAY_CLIENT_ID or EBAY_CLIENT_SECRET")
 
+    auth = requests.auth.HTTPBasicAuth(EBAY_CLIENT_ID, EBAY_CLIENT_SECRET)
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": USER_AGENT,
+    }
 
-def get_oauth_token() -> str:
-    client_id = env_required("EBAY_CLIENT_ID")
-    client_secret = env_required("EBAY_CLIENT_SECRET")
+    # Client credentials token
+    data = {
+        "grant_type": "client_credentials",
+        "scope": "https://api.ebay.com/oauth/api_scope",
+    }
 
-    r = requests.post(
-        EBAY_OAUTH_URL,
-        auth=(client_id, client_secret),
-        data={
-            "grant_type": "client_credentials",
-            "scope": "https://api.ebay.com/oauth/api_scope",
-        },
-        timeout=30,
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(f"eBay OAuth error {r.status_code}: {r.text[:300]}")
+    r = requests.post(EBAY_OAUTH_URL, headers=headers, data=data, auth=auth, timeout=REQUEST_TIMEOUT_SEC)
+    if r.status_code != 200:
+        raise RuntimeError(f"Failed to get token: {r.status_code} {r.text}")
+
     j = r.json()
-    token = j.get("access_token", "")
+    token = j.get("access_token")
     if not token:
-        raise RuntimeError("Missing access_token from eBay OAuth response")
+        raise RuntimeError(f"Token missing in response: {j}")
     return token
 
 
-def request_with_backoff(
-    token: str,
-    params: Dict[str, Any],
-    max_attempts: int = 6,
-) -> Optional[Dict[str, Any]]:
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-EBAY-C-MARKETPLACE-ID": MARKETPLACE_ID,
-        "Accept": "application/json",
-    }
+def request_with_backoff(method: str, url: str, headers: Dict[str, str], params: Dict[str, Any]) -> Dict[str, Any]:
+    max_tries = 7
+    base_sleep = 1.2
 
-    backoff = 2.0
-    for attempt in range(1, max_attempts + 1):
-        r = requests.get(EBAY_SEARCH_URL, headers=headers, params=params, timeout=35)
+    for attempt in range(1, max_tries + 1):
+        time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
+
+        r = requests.request(method, url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SEC)
 
         if r.status_code == 200:
-            try:
-                return r.json()
-            except Exception:
-                return None
+            return r.json()
 
-        if r.status_code == 401:
-            return None
+        # Rate limited
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    sleep_s = float(retry_after)
+                except Exception:
+                    sleep_s = base_sleep * attempt
+            else:
+                sleep_s = base_sleep * attempt
 
-        if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
-            sleep_for = min(30.0, backoff + random.random())
-            log(f"rate limited or server error {r.status_code}, sleep {sleep_for:.1f}s")
-            time.sleep(sleep_for)
-            backoff = min(backoff * 1.8, 30.0)
+            # Add jitter
+            sleep_s = min(90.0, sleep_s + random.uniform(0.4, 1.6))
+            log(f"rate limited 429, sleeping {sleep_s:.1f}s")
+            time.sleep(sleep_s)
             continue
 
-        if r.status_code >= 400:
-            log(f"ebay error {r.status_code}: {r.text[:200]}")
-            return None
+        # Transient server errors
+        if r.status_code in (500, 502, 503, 504):
+            sleep_s = min(60.0, base_sleep * attempt + random.uniform(0.4, 1.6))
+            log(f"server error {r.status_code}, sleeping {sleep_s:.1f}s")
+            time.sleep(sleep_s)
+            continue
 
-    return None
+        # Anything else is a real failure
+        raise RuntimeError(f"eBay error {r.status_code}: {r.text}")
+
+    raise RuntimeError("eBay request failed after retries")
 
 
 def ebay_search(
     token: str,
-    query: str,
+    q: str,
     buying_option: str,
     limit: int,
-    sort: str = "endingSoonest",
-    use_category: bool = True,
+    sort: str,
 ) -> List[Dict[str, Any]]:
-    filters = [f"buyingOptions:{{{buying_option}}}"]
-
-    params: Dict[str, Any] = {
-        "q": query,
-        "limit": str(limit),
-        "sort": sort,
-        "filter": ",".join(filters),
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": USER_AGENT,
     }
 
-    if use_category and CATEGORY_IDS:
-        params["category_ids"] = CATEGORY_IDS
+    # Auction or Fixed price
+    params: Dict[str, Any] = {
+        "q": q,
+        "limit": limit,
+        "sort": sort,
+        "filter": f"buyingOptions:{{{buying_option}}}",
+    }
 
-    j = request_with_backoff(token, params)
-    if not j:
-        return []
+    j = request_with_backoff("GET", EBAY_BROWSE_SEARCH_URL, headers=headers, params=params)
     return j.get("itemSummaries", []) or []
 
 
-def total_cost_from_item(item: Dict[str, Any]) -> float:
-    price_obj = item.get("currentBidPrice") or item.get("price") or item.get("currentPrice") or {}
-    price_val = money_value(price_obj)
+def extract_price(item: Dict[str, Any]) -> Tuple[float, float]:
+    """
+    Returns (item_price, shipping_price)
+    """
+    price = 0.0
+    shipping = 0.0
 
-    ship_val = 0.0
-    ship_opts = item.get("shippingOptions") or []
-    if ship_opts:
-        s0 = ship_opts[0] or {}
-        ship_cost = s0.get("shippingCost") or {}
-        ship_val = money_value(ship_cost)
+    p = item.get("price") or {}
+    try:
+        price = float(p.get("value") or 0.0)
+    except Exception:
+        price = 0.0
 
-    return float(price_val + ship_val)
+    sp = item.get("shippingOptions") or []
+    if sp and isinstance(sp, list):
+        first = sp[0] or {}
+        shipping_cost = first.get("shippingCost") or {}
+        try:
+            shipping = float(shipping_cost.get("value") or 0.0)
+        except Exception:
+            shipping = 0.0
 
-
-def ends_at_from_item(item: Dict[str, Any]) -> Optional[datetime]:
-    return parse_iso(item.get("itemEndDate"))
-
-
-def build_comp_query(title: str) -> str:
-    t = (title or "")
-    t = re.sub(r"\([^)]*\)", " ", t)
-    t = re.sub(r"\[[^\]]*\]", " ", t)
-    t = re.sub(r"[^A-Za-z0-9\s/#]+", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-
-    tokens: List[str] = []
-    for raw in t.split(" "):
-        low = raw.lower()
-        if low in STOP_WORDS:
-            continue
-        if len(low) <= 1:
-            continue
-        tokens.append(raw)
-
-    if not tokens:
-        return t[:120]
-    return " ".join(tokens[:12])[:120]
+    return price, shipping
 
 
-def median(values: List[float]) -> float:
-    if not values:
-        return 0.0
-    values = sorted(values)
-    n = len(values)
-    mid = n // 2
-    if n % 2 == 1:
-        return float(values[mid])
-    return float((values[mid - 1] + values[mid]) / 2.0)
+def extract_urls(item: Dict[str, Any]) -> Tuple[str, str]:
+    url = item.get("itemWebUrl") or ""
+    image_url = ""
+    img = item.get("image") or {}
+    image_url = img.get("imageUrl") or ""
+    return url, image_url
 
 
-class CompCache:
-    def __init__(self) -> None:
-        self.store: Dict[str, Tuple[float, int]] = {}
+def normalize_title_for_comps(title: str) -> str:
+    t = title.lower()
 
-    def get(self, key: str) -> Optional[Tuple[float, int]]:
-        return self.store.get(key)
+    # Strip words that create noisy comp pools
+    noise = [
+        "🔥",
+        "hot",
+        "rare",
+        "ssp",
+        "case hit",
+        "invest",
+        "look",
+        "wow",
+        "insane",
+        "mint",
+        "gem",
+        "pop",
+        "low pop",
+    ]
+    for n in noise:
+        t = t.replace(n, " ")
 
-    def set(self, key: str, value: Tuple[float, int]) -> None:
-        self.store[key] = value
+    # Reduce whitespace
+    t = " ".join(t.split())
+    return t[:120]
 
 
-def estimate_market_fixed_price(
-    token: str,
-    title: str,
-    cache: CompCache,
-) -> Tuple[float, int]:
-    comp_q = build_comp_query(title)
-    cached = cache.get(comp_q)
-    if cached:
-        return cached[0], cached[1]
-
-    items = ebay_search(
-        token,
-        comp_q,
-        buying_option="FIXED_PRICE",
-        limit=MAX_FIXED_PRICE_RESULTS,
-        sort="bestMatch",
-        use_category=True,
-    )
+def estimate_market_from_fixed_price(token: str, title: str) -> Tuple[float, int]:
+    """
+    Market estimate based on fixed price listings.
+    Uses median of prices after trimming outliers.
+    Returns (market_estimate, comp_count_used)
+    """
+    base = normalize_title_for_comps(title)
 
     prices: List[float] = []
-    for it in items:
-        p = money_value(it.get("price") or {})
-        if p > 0:
-            prices.append(float(p))
+
+    for tweak in COMP_QUERY_TWEAKS:
+        comp_q = (base + tweak).strip()
+        items = ebay_search(
+            token=token,
+            q=comp_q,
+            buying_option="FIXED_PRICE",
+            limit=COMP_FIXED_PRICE_LIMIT,
+            sort="price",  # cheapest first gives better flip signal
+        )
+
+        for it in items:
+            p, ship = extract_price(it)
+            total = float(p) + float(ship)
+            if total <= 0:
+                continue
+            # Ignore absurd comps
+            if total > 20000:
+                continue
+            prices.append(total)
+
+        # Keep the comp calls low
+        if len(prices) >= 18:
+            break
 
     if len(prices) < 6:
-        cache.set(comp_q, (0.0, len(prices)))
         return 0.0, len(prices)
 
     prices.sort()
-    trim = int(len(prices) * 0.2)
-    core = prices[trim: len(prices) - trim] if len(prices) - 2 * trim >= 5 else prices
 
-    m = median(core)
-    cache.set(comp_q, (m, len(prices)))
-    return m, len(prices)
+    # Trim the extreme ends to reduce bad comps
+    trim = max(1, int(len(prices) * 0.15))
+    core = prices[trim : len(prices) - trim] if len(prices) - 2 * trim >= 3 else prices
 
-
-def profit_estimate(market: float, total_cost: float) -> float:
-    net_sale = (market * MARKET_HAIRCUT)
-    fees = (net_sale * FEE_RATE) + FIXED_FEE
-    return net_sale - fees - total_cost
+    core.sort()
+    mid = core[len(core) // 2]
+    return float(round(mid, 2)), len(core)
 
 
-def should_consider_item(title: str, ends_at: Optional[datetime], bids: int, total_cost: float) -> bool:
-    if not title:
-        return False
-    if is_bad_title(title):
-        return False
+def compute_profit(market: float, total_cost: float) -> float:
+    """
+    Conservative profit estimate:
+    subtract estimated fees and small friction cost.
+    """
+    if market <= 0:
+        return 0.0
 
-    if not ends_at:
-        return False
-    mins = minutes_away(ends_at)
-    if mins is None or mins < 0 or mins > MAX_ENDS_WITHIN_MINUTES:
-        return False
+    # Rough fees estimate, conservative
+    platform_fee = market * 0.135
+    friction = 4.0
 
-    if bids > MAX_BID_COUNT:
-        return False
-
-    if total_cost <= 0 or total_cost > MAX_TOTAL_COST:
-        return False
-
-    # Fast upside heuristic, skip boring base cards unless mislisted queries
-    if not has_good_signals(title):
-        return False
-
-    return True
+    profit = market - platform_fee - friction - total_cost
+    return float(round(profit, 2))
 
 
-def run() -> None:
-    log(f"SCANNER VERSION: {SCANNER_VERSION}")
+def connect_db():
+    if not DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL")
+    return psycopg2.connect(DATABASE_URL)
 
-    init_db()
 
-    token = get_oauth_token()
-
-    mark_all_inactive()
-
-    cache = CompCache()
-
-    seen = 0
-    kept = 0
-    comp_calls = 0
-
-    # Strategy bundle
-    # 1) Core upside
-    # 2) Misspell bait
-    # 3) Miscat narrow searches without category filter
-    queries: List[Tuple[str, bool]] = []
-    for q in CORE_QUERIES:
-        queries.append((q, True))
-    for q in MISSPELL_QUERIES:
-        queries.append((q, True))
-    for q in MISCAT_QUERIES:
-        queries.append((q, False))
-
-    for q, use_category in queries:
-        time.sleep(SLEEP_BETWEEN_QUERIES_SEC)
-        log(f"query: {q}")
-
-        auctions = ebay_search(
-            token,
-            q,
-            buying_option="AUCTION",
-            limit=MAX_AUCTION_RESULTS,
-            sort="endingSoonest",
-            use_category=use_category,
+def ensure_schema(conn) -> None:
+    """
+    Ensures the dashboard will not crash by guaranteeing deals.id exists.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deals (
+                id BIGSERIAL,
+                item_id TEXT,
+                title TEXT,
+                url TEXT,
+                image_url TEXT,
+                query TEXT,
+                total_cost DOUBLE PRECISION,
+                market DOUBLE PRECISION,
+                profit DOUBLE PRECISION,
+                ends_at TIMESTAMPTZ,
+                minutes_away INTEGER,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
         )
 
+        # Add id if table existed without it
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name='deals' AND column_name='id'
+                ) THEN
+                    ALTER TABLE deals ADD COLUMN id BIGSERIAL;
+                END IF;
+            END $$;
+            """
+        )
+
+        # Ensure item_id exists
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name='deals' AND column_name='item_id'
+                ) THEN
+                    ALTER TABLE deals ADD COLUMN item_id TEXT;
+                END IF;
+            END $$;
+            """
+        )
+
+        # Ensure a unique constraint on item_id so upserts work
+        cur.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_indexes
+                    WHERE tablename='deals' AND indexname='deals_item_id_uidx'
+                ) THEN
+                    CREATE UNIQUE INDEX deals_item_id_uidx ON deals(item_id);
+                END IF;
+            END $$;
+            """
+        )
+
+        conn.commit()
+
+
+def mark_all_inactive(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("UPDATE deals SET is_active = FALSE, updated_at = NOW() WHERE is_active = TRUE;")
+    conn.commit()
+
+
+def upsert_deal(conn, d: Deal) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO deals (
+                item_id, title, url, image_url, query,
+                total_cost, market, profit, ends_at, minutes_away,
+                is_active, created_at, updated_at
+            )
+            VALUES (
+                %(item_id)s, %(title)s, %(url)s, %(image_url)s, %(query)s,
+                %(total_cost)s, %(market)s, %(profit)s, %(ends_at)s, %(minutes_away)s,
+                TRUE, NOW(), NOW()
+            )
+            ON CONFLICT (item_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                url = EXCLUDED.url,
+                image_url = EXCLUDED.image_url,
+                query = EXCLUDED.query,
+                total_cost = EXCLUDED.total_cost,
+                market = EXCLUDED.market,
+                profit = EXCLUDED.profit,
+                ends_at = EXCLUDED.ends_at,
+                minutes_away = EXCLUDED.minutes_away,
+                is_active = TRUE,
+                updated_at = NOW();
+            """,
+            {
+                "item_id": d.item_id,
+                "title": d.title,
+                "url": d.url,
+                "image_url": d.image_url,
+                "query": d.query,
+                "total_cost": d.total_cost,
+                "market": d.market,
+                "profit": d.profit,
+                "ends_at": d.ends_at,
+                "minutes_away": d.minutes_away,
+            },
+        )
+    conn.commit()
+
+
+def scan() -> None:
+    log(f"SCANNER VERSION: {SCANNER_VERSION}")
+
+    token = get_access_token()
+
+    conn = connect_db()
+    ensure_schema(conn)
+
+    # Reset actives each run, then re activate what we still like
+    mark_all_inactive(conn)
+
+    kept: List[Deal] = []
+    comp_lookups = 0
+
+    # Pull auctions in ending soon order, then filter for minutes away ourselves
+    for q in AUCTION_QUERIES:
+        if len(kept) >= MAX_DEALS_TO_SAVE_PER_RUN:
+            break
+
+        log(f"query: {q}")
+        auctions = ebay_search(
+            token=token,
+            q=q,
+            buying_option="AUCTION",
+            limit=MAX_AUCTION_RESULTS_PER_QUERY,
+            sort="endingSoonest",
+        )
         log(f"items returned: {len(auctions)}")
 
-        for it in auctions:
-            seen += 1
+        for item in auctions:
+            if len(kept) >= MAX_DEALS_TO_SAVE_PER_RUN:
+                break
 
-            title = (it.get("title") or "").strip()
-            item_id = it.get("itemId")
-            if not item_id or not title:
+            title = (item.get("title") or "").strip()
+            if not title:
                 continue
 
-            ends_at = ends_at_from_item(it)
-            bids = item_bid_count(it)
-            total_cost = total_cost_from_item(it)
-
-            if not should_consider_item(title, ends_at, bids, total_cost):
+            if is_blocked_title(title):
                 continue
 
-            if comp_calls >= MAX_COMP_CALLS_PER_RUN:
+            item_id = item.get("itemId") or ""
+            if not item_id:
                 continue
 
-            time.sleep(SLEEP_BETWEEN_COMP_CALLS_SEC)
-
-            market, comp_count = estimate_market_fixed_price(token, title, cache)
-            comp_calls += 1
-
-            if market <= 0:
+            ends_at = parse_ebay_time((item.get("itemEndDate") or item.get("itemEndDateTime") or item.get("estimatedEndTime")))
+            if not ends_at:
+                # browse sometimes omits, skip
                 continue
 
-            profit = profit_estimate(market, total_cost)
+            mins = minutes_until(ends_at)
+            if mins is None:
+                continue
+
+            if mins < 0 or mins > MINUTES_AWAY_CUTOFF:
+                continue
+
+            price, ship = extract_price(item)
+            total_cost = float(round(price + ship, 2))
+
+            # quick sanity filters so we do not burn comp calls on junk
+            if total_cost <= 0:
+                continue
+            if total_cost > 2000:
+                continue
+
+            # We only do comp lookups on candidates that could plausibly hit profit floor.
+            # Assume fees plus friction around 18 percent, so market must beat cost by margin.
+            rough_needed_market = total_cost + MIN_PROFIT_USD + (total_cost * 0.15) + 10.0
+            if rough_needed_market > 3500:
+                continue
+
+            if comp_lookups >= MAX_COMP_LOOKUPS_PER_RUN:
+                continue
+
+            market, comp_count = estimate_market_from_fixed_price(token, title)
+            comp_lookups += 1
+
+            if market <= 0 or comp_count < 6:
+                continue
+
+            profit = compute_profit(market=market, total_cost=total_cost)
             if profit < MIN_PROFIT_USD:
                 continue
 
-            deal = {
-                "item_id": str(item_id),
-                "title": title,
-                "url": it.get("itemWebUrl"),
-                "image_url": (it.get("image") or {}).get("imageUrl"),
-                "query": q,
-                "total_cost": float(round(total_cost, 2)),
-                "market": float(round(market, 2)),
-                "profit": float(round(profit, 2)),
-                "ends_at": ends_at,
-                "is_active": True,
-            }
+            url, image_url = extract_urls(item)
 
-            upsert_deal(deal)
-            kept += 1
+            d = Deal(
+                item_id=item_id,
+                title=title,
+                url=url,
+                image_url=image_url,
+                query=q,
+                total_cost=total_cost,
+                market=market,
+                profit=profit,
+                ends_at=ends_at,
+                minutes_away=mins,
+            )
 
-        log(f"kept so far: {kept}")
+            kept.append(d)
 
-    pruned = prune_inactive()
-    log(f"seen: {seen}")
-    log(f"kept: {kept}")
-    log(f"comp_calls: {comp_calls}")
-    log(f"pruned_inactive: {pruned}")
+    # Sort by nearest ending, then highest profit
+    kept.sort(key=lambda d: ((d.minutes_away if d.minutes_away is not None else 10**9), -d.profit))
+
+    saved = 0
+    for d in kept:
+        if saved >= MAX_DEALS_TO_SAVE_PER_RUN:
+            break
+        upsert_deal(conn, d)
+        saved += 1
+
+    conn.close()
+
+    log(f"seen queries: {len(AUCTION_QUERIES)}")
+    log(f"comp lookups used: {comp_lookups}")
+    log(f"kept: {len(kept)}")
+    log(f"saved: {saved}")
 
 
 if __name__ == "__main__":
-    run()
+    scan()
