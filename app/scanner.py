@@ -1,227 +1,281 @@
 import os
 import re
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from statistics import median
+from typing import Any
 
-from sqlalchemy.orm import Session
+import requests
 
 from app.db import init_db, mark_all_inactive, prune_inactive, upsert_deal
-from app.ebay_browse import item_total_cost, search_browse, usd_amount
 
 
-SCANNER_VERSION = "AUCTIONS_SINGLES_MINPROFIT150_OAUTHFIX_V1"
+SCANNER_VERSION = "AUCTIONS_SINGLES_MINPROFIT150_V1"
 
-DEFAULT_MIN_PROFIT = float(os.getenv("MIN_PROFIT", "150").strip() or "150")
-DEFAULT_FEE_RATE = float(os.getenv("FEE_RATE", "0.13").strip() or "0.13")
-DEFAULT_MARKET_HAIRCURT = float(os.getenv("MARKET_HAIRCUT", "0.90").strip() or "0.90")
+EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
+BROWSE_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 
-CATEGORY_SPORTS_CARDS = os.getenv("EBAY_CATEGORY_IDS", "").strip()  # optional
-
+DEFAULT_QUERIES = [
+    "psa 10 football ssp",
+    "psa 10 football 1/1",
+    "psa 10 football /10",
+    "psa 10 football /25",
+    "psa 10 football /50",
+    "psa 10 prizm black",
+    "psa 10 kaboom",
+    "psa 10 downtown",
+    "psa 10 color blast",
+    "psa 10 gold vinyl",
+    "psa 10 on card auto /25",
+]
 
 LOT_BAD_WORDS = [
     "lot",
-    "lots",
-    "bundle",
-    "bundles",
+    "binder",
+    "collection",
     "bulk",
-    "pack",
     "packs",
+    "pack",
+    "box",
+    "case",
     "break",
     "breaks",
-    "case",
-    "cases",
-    "team lot",
+    "team set",
     "player lot",
     "mystery",
 ]
 
+STOP_WORDS = {
+    "hot", "rare", "nice", "great", "awesome", "mint", "gem", "mt", "rc", "rookie",
+    "card", "cards", "auto", "autograph", "autograoh", "on", "a", "an", "the", "of",
+    "and", "with", "for", "to", "by", "panini", "topps"
+}
 
-def _log(msg: str):
+
+def log(msg: str) -> None:
     print(f"SCANNER: {msg}", flush=True)
 
 
-def _utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _parse_end_time(item: Dict[str, Any]) -> Optional[datetime]:
-    s = item.get("itemEndDate") or item.get("endDate") or None
-    if not s:
-        return None
+def get_env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    if not v:
+        return default
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return int(v)
     except Exception:
-        return None
+        return default
 
 
-def _is_lot(title: str) -> bool:
-    t = (title or "").lower()
+def get_oauth_token() -> str:
+    client_id = os.environ.get("EBAY_CLIENT_ID")
+    client_secret = os.environ.get("EBAY_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise RuntimeError("Missing EBAY_CLIENT_ID or EBAY_CLIENT_SECRET")
+
+    auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
+    data = {
+        "grant_type": "client_credentials",
+        "scope": "https://api.ebay.com/oauth/api_scope",
+    }
+    r = requests.post(EBAY_OAUTH_URL, auth=auth, data=data, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    return j["access_token"]
+
+
+def is_lot(title: str) -> bool:
+    t = title.lower()
+    if re.search(r"\b\d+\s*cards?\b", t):
+        return True
     for w in LOT_BAD_WORDS:
         if w in t:
             return True
     return False
 
 
-def _looks_like_single_card(title: str) -> bool:
-    """
-    Best effort single card filter.
-    Reject obvious lots, breaks, packs.
-    Keep graded singles and individual card keywords.
-    """
-    if _is_lot(title):
-        return False
-
-    t = (title or "").lower()
-
-    if "cards" in t and "1 card" not in t:
-        return False
-
-    if "random" in t:
-        return False
-
-    return True
+def parse_money(obj: Any) -> float:
+    if not obj:
+        return 0.0
+    try:
+        v = obj.get("value")
+        if v is None:
+            return 0.0
+        return float(v)
+    except Exception:
+        return 0.0
 
 
-def _normalize_for_market(title: str) -> str:
-    t = (title or "")
-    t = re.sub(r"\b(auction|ending|ends|no reserve|nr)\b", " ", t, flags=re.I)
-    t = re.sub(r"\b(lot|bundle|break|packs?)\b", " ", t, flags=re.I)
+def parse_end_date(item: dict[str, Any]) -> datetime | None:
+    s = item.get("itemEndDate")
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def build_comp_query(title: str) -> str:
+    t = re.sub(r"[^A-Za-z0-9\s/#]+", " ", title)
     t = re.sub(r"\s+", " ", t).strip()
-    return t[:120]
+
+    tokens = []
+    for raw in t.split(" "):
+        low = raw.lower()
+        if low in STOP_WORDS:
+            continue
+        if len(low) <= 1:
+            continue
+        tokens.append(raw)
+
+    keep = tokens[:10]
+    return " ".join(keep) if keep else title
 
 
-def _estimate_market_fixed_price(title: str) -> float:
-    """
-    Uses fixed price listings as a proxy.
-    Conservative: take the lower quartile-ish by sorting and sampling low priced results.
-    """
-    q = _normalize_for_market(title)
-    if not q:
-        return 0.0
+def ebay_search(token: str, q: str, buying_option: str, limit: int = 200) -> list[dict[str, Any]]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    params = {
+        "q": q,
+        "limit": str(limit),
+        "sort": "endingSoonest" if buying_option == "AUCTION" else "bestMatch",
+        "filter": f"buyingOptions:{{{buying_option}}}",
+    }
+    r = requests.get(BROWSE_SEARCH_URL, headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    return j.get("itemSummaries", []) or []
 
-    items = search_browse(q, buying_option="FIXED_PRICE", limit=50, sort="price")
-    costs = []
+
+def total_cost_from_item(item: dict[str, Any]) -> float:
+    price = parse_money(item.get("price"))
+    ship = 0.0
+    ship_opts = item.get("shippingOptions") or []
+    if ship_opts:
+        ship = parse_money((ship_opts[0] or {}).get("shippingCost"))
+    return float(price + ship)
+
+
+def estimate_market_from_fixed_price(token: str, title: str) -> tuple[float, int]:
+    comp_q = build_comp_query(title)
+
+    items = ebay_search(token, comp_q, "FIXED_PRICE", limit=50)
+
+    prices: list[float] = []
     for it in items:
-        costs.append(item_total_cost(it))
-    costs = [c for c in costs if c > 0]
-    if not costs:
-        return 0.0
+        cost = total_cost_from_item(it)
+        if cost > 0:
+            prices.append(cost)
 
-    costs.sort()
-    idx = max(0, int(len(costs) * 0.25) - 1)
-    return float(costs[idx])
+    if len(prices) < 8:
+        return 0.0, len(prices)
 
-
-def _profit_estimate(market: float, total_cost: float) -> float:
-    """
-    Conservative profit:
-    take market haircut then subtract fees then subtract total cost
-    """
-    net_sale = market * DEFAULT_MARKET_HAIRCURT
-    fees = net_sale * DEFAULT_FEE_RATE
-    return net_sale - fees - total_cost
+    prices.sort()
+    trim = int(len(prices) * 0.2)
+    trimmed = prices[trim: len(prices) - trim] if len(prices) - trim > trim else prices
+    return float(median(trimmed)), len(prices)
 
 
-def _queries() -> List[str]:
-    base = [
-        "psa 10 football",
-        "psa 10 rookie",
-        "prizm rookie psa 10",
-        "downtown psa 10",
-        "kaboom psa 10",
-        "color blast psa 10",
-        "gold /10 psa 10",
-        "black 1/1 psa",
-        "on card auto psa 10",
-        "ssp psa 10 football",
-        "case hit psa 10",
-    ]
-    # you can override by env QUERIES separated by |
-    raw = os.getenv("QUERIES", "").strip()
-    if raw:
-        parts = [p.strip() for p in raw.split("|") if p.strip()]
-        if parts:
-            return parts
-    return base
+def run() -> None:
+    log(f"SCANNER VERSION: {SCANNER_VERSION}")
 
+    min_profit = float(get_env_int("MIN_PROFIT", 150))
+    max_rows = int(get_env_int("MAX_ROWS", 200))
+    sleep_s = float(get_env_int("REQUEST_SLEEP_SECONDS", 1))
 
-def run():
-    _log(f"SCANNER VERSION: {SCANNER_VERSION}")
+    queries_env = os.environ.get("QUERIES_JSON")
+    if queries_env:
+        try:
+            import json
+            queries = json.loads(queries_env)
+            if not isinstance(queries, list) or not queries:
+                queries = DEFAULT_QUERIES
+        except Exception:
+            queries = DEFAULT_QUERIES
+    else:
+        queries = DEFAULT_QUERIES
 
-    eng = init_db()
-    with Session(eng) as session:
-        _log("db: connected, schema ensured, marked all inactive")
-        mark_all_inactive(session)
+    init_db()
+    mark_all_inactive()
 
-        queries = _queries()
-        _log(f"queries: {len(queries)}")
+    token = get_oauth_token()
 
-        seen = 0
-        kept = 0
+    kept = 0
+    seen = 0
 
-        for q in queries:
-            _log(f"query: {q}")
-            items = search_browse(q, buying_option="AUCTION", limit=200, sort="endingSoonest", category_ids=CATEGORY_SPORTS_CARDS)
-            _log(f"items returned: {len(items)}")
+    for q in queries:
+        log(f"query: {q}")
 
-            for it in items:
-                seen += 1
+        try:
+            auction_items = ebay_search(token, q, "AUCTION", limit=max_rows)
+        except Exception as e:
+            log(f"search failed for query {q}: {e}")
+            continue
 
-                title = it.get("title") or ""
-                if not title:
-                    continue
+        log(f"items returned: {len(auction_items)}")
 
-                if not _looks_like_single_card(title):
-                    continue
+        for item in auction_items:
+            seen += 1
 
-                total_cost = item_total_cost(it)
-                if total_cost <= 0:
-                    continue
+            title = (item.get("title") or "").strip()
+            if not title:
+                continue
 
-                market = _estimate_market_fixed_price(title)
-                if market <= 0:
-                    continue
+            if is_lot(title):
+                continue
 
-                profit = _profit_estimate(market, total_cost)
+            item_id = item.get("itemId")
+            if not item_id:
+                continue
 
-                if profit < DEFAULT_MIN_PROFIT:
-                    continue
+            url = item.get("itemWebUrl")
+            image_url = None
+            img = item.get("image") or {}
+            if isinstance(img, dict):
+                image_url = img.get("imageUrl")
 
-                item_id = it.get("itemId") or ""
-                url = it.get("itemWebUrl") or ""
-                img = ""
-                if it.get("image") and isinstance(it["image"], dict):
-                    img = it["image"].get("imageUrl", "") or ""
+            ends_at_dt = parse_end_date(item)
+            if ends_at_dt is None:
+                continue
 
-                end_time = _parse_end_time(it)
+            total_cost = total_cost_from_item(item)
+            if total_cost <= 0:
+                continue
 
-                if not item_id or not url:
-                    continue
+            market, comp_count = estimate_market_from_fixed_price(token, title)
+            if market <= 0:
+                continue
 
-                upsert_deal(
-                    session,
-                    {
-                        "item_id": item_id,
-                        "title": title,
-                        "url": url,
-                        "image_url": img,
-                        "query": q,
-                        "total_cost": float(total_cost),
-                        "market": float(market),
-                        "profit": float(profit),
-                        "end_time": end_time,
-                    },
-                )
-                kept += 1
+            profit = market - total_cost
+            if profit < min_profit:
+                continue
 
-        _log("db: pruned inactive rows (not seen in latest run)")
-        prune_inactive(session)
+            deal = {
+                "item_id": str(item_id),
+                "title": title,
+                "url": url,
+                "image_url": image_url,
+                "query": q,
+                "total_cost": float(total_cost),
+                "market": float(market),
+                "profit": float(profit),
+                "ends_at": ends_at_dt,
+            }
 
-        _log(f"seen: {seen}")
-        _log(f"kept: {kept}")
-        _log(f"min_profit: {DEFAULT_MIN_PROFIT}")
-        _log(f"fee_rate: {DEFAULT_FEE_RATE}")
-        _log(f"market_haircut: {DEFAULT_MARKET_HAIRCURT}")
+            upsert_deal(deal)
+            kept += 1
+
+            time.sleep(sleep_s)
+
+        time.sleep(sleep_s)
+
+    prune_inactive()
+    log(f"seen: {seen}")
+    log(f"kept: {kept}")
 
 
 if __name__ == "__main__":
