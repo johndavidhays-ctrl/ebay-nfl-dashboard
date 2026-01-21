@@ -4,16 +4,21 @@ from app.db import init_db, get_conn
 from app.ebay_auth import get_app_token
 from app.ebay_browse import browse_search
 
-SCANNER_VERSION = "SINGLES_ONLY_SLEEPER_HUNT"
+SCANNER_VERSION = "SINGLES_ONLY_100_PROFIT_BIG_UPSIDE_UNDER_1000"
 
+# Singles only, no lots
 MIN_BUY_PRICE = 10.0
 MAX_BUY_PRICE = 1000.0
-MIN_PROFIT = 10.0
+
+# Only show big upside opportunities
+MIN_PROFIT = 100.0
+
+# Require estimated value to be at least 2x total cost
+UPSIDE_MULTIPLE = 2.0
 
 EBAY_FEE_RATE = 0.13
 MAX_ITEMS_PER_QUERY = 50
 
-# Search terms designed for singles, not lots
 SEARCH_QUERIES = [
     "rookie card",
     "autograph card",
@@ -31,32 +36,30 @@ SEARCH_QUERIES = [
     "sports card",
 ]
 
-# Hard exclude anything that looks like a lot
 LOT_EXCLUDE_WORDS = [
     "lot", "lots", "collection", "binder", "shoebox", "bulk",
-    "cards", "assorted", "misc", "set of", "complete set"
+    "assorted", "misc", "set of", "complete set"
 ]
 
-# Signals that imply higher value than seller may realize
 VALUE_HINTS = {
     "refractor": 45,
+    "holo": 25,
     "silver": 30,
     "chrome": 30,
     "rookie": 25,
     "rc": 25,
-    "auto": 70,
-    "autograph": 70,
-    "patch": 55,
-    "jersey": 40,
-    "numbered": 45,
-    "parallel": 30,
-    "variation": 40,
-    "short print": 40,
+    "auto": 80,
+    "autograph": 80,
+    "patch": 60,
+    "jersey": 45,
+    "numbered": 55,
+    "parallel": 35,
+    "variation": 45,
+    "short print": 45,
     "sp": 25,
-    "insert": 15,
+    "insert": 20,
 }
 
-# Misspelling patterns that indicate sloppy listings
 MISSPELL_PATTERNS = [
     r"\srooky\s",
     r"\srooki\s",
@@ -66,70 +69,90 @@ MISSPELL_PATTERNS = [
     r"\soptik\s",
 ]
 
-def sold_url(title):
+
+def sold_url(title: str) -> str:
     q = urllib.parse.quote(title)
     return f"https://www.ebay.com/sch/i.html?_nkw={q}&LH_Sold=1&LH_Complete=1"
 
-def safe_float(x, default=0.0):
+
+def safe_float(x, default=0.0) -> float:
     try:
         return float(x)
     except Exception:
         return default
 
-def extract_price(item):
+
+def extract_price(item) -> float:
     return safe_float((item.get("price") or {}).get("value"), 0.0)
 
-def extract_shipping(item):
+
+def extract_shipping(item) -> float:
     ship = 0.0
     ship_opts = item.get("shippingOptions") or []
     if ship_opts:
         ship = safe_float(((ship_opts[0] or {}).get("shippingCost") or {}).get("value"), 0.0)
     return ship
 
-def listing_type(item):
+
+def listing_type(item) -> str:
     opts = item.get("buyingOptions") or []
     if "AUCTION" in opts:
         return "AUCTION"
     if "FIXED_PRICE" in opts:
         return "BIN"
+    if "BEST_OFFER" in opts:
+        return "BEST_OFFER"
     return "UNKNOWN"
+
 
 def looks_like_lot(title: str) -> bool:
     t = title.lower()
     return any(w in t for w in LOT_EXCLUDE_WORDS)
 
+
 def estimate_value_from_title(title: str) -> float:
     t = f" {title.lower()} "
-    base = 20.0
+    base = 35.0
     bonus = 0.0
 
     for k, v in VALUE_HINTS.items():
         if k in t:
-            bonus += v
+            bonus += float(v)
 
     year_match = re.search(r"\b(19\d{2}|20\d{2})\b", t)
     if year_match:
-        bonus += 10.0
+        bonus += 15.0
 
     for pat in MISSPELL_PATTERNS:
         if re.search(pat, t):
-            bonus += 8.0
+            bonus += 12.0
 
     return base + bonus
 
-def estimate_profit(price, shipping, est_sale):
+
+def estimate_profit(price: float, shipping: float, est_sale: float) -> float:
     total_cost = price + shipping
     ebay_fee = est_sale * EBAY_FEE_RATE
     return est_sale - total_cost - ebay_fee
 
-def compute_score(misprice, profit, roi, ltype):
+
+def has_big_upside(est_value: float, total_cost: float) -> bool:
+    if total_cost <= 0:
+        return False
+    return est_value >= total_cost * UPSIDE_MULTIPLE
+
+
+def compute_score(misprice: float, profit: float, roi: float, ltype: str) -> float:
     score = 0.0
-    score += misprice * 1.2
-    score += profit * 2.0
-    score += roi * 25.0
+    score += misprice * 1.4
+    score += profit * 2.2
+    score += roi * 30.0
+
     if ltype == "AUCTION":
-        score += 20.0
+        score += 30.0
+
     return round(score, 2)
+
 
 def run():
     print(f"SCANNER VERSION: {SCANNER_VERSION}")
@@ -158,8 +181,14 @@ def run():
         for item in items:
             total_seen += 1
 
+            item_id = item.get("itemId")
             title = item.get("title") or ""
-            if not title or looks_like_lot(title):
+            item_url = item.get("itemWebUrl")
+
+            if not item_id or not title or not item_url:
+                continue
+
+            if looks_like_lot(title):
                 continue
 
             price = extract_price(item)
@@ -169,13 +198,16 @@ def run():
                 continue
 
             est_value = estimate_value_from_title(title)
-            profit = estimate_profit(price, shipping, est_value)
             cost = price + shipping
-            roi = profit / cost if cost > 0 else 0.0
 
+            if not has_big_upside(est_value, cost):
+                continue
+
+            profit = estimate_profit(price, shipping, est_value)
             if profit < MIN_PROFIT:
                 continue
 
+            roi = profit / cost if cost > 0 else 0.0
             ltype = listing_type(item)
             misprice = est_value - cost
             score = compute_score(misprice, profit, roi, ltype)
@@ -209,9 +241,9 @@ def run():
                             listing_type = EXCLUDED.listing_type
                         """,
                         (
-                            item.get("itemId"),
+                            str(item_id),
                             title,
-                            item.get("itemWebUrl"),
+                            str(item_url),
                             sold_url(title),
                             round(price, 2),
                             round(shipping, 2),
@@ -229,6 +261,7 @@ def run():
     print(f"SCANNER: total_seen: {total_seen}")
     print(f"SCANNER: total_kept: {total_kept}")
     print(f"SCANNER: total_inserted: {total_inserted}")
+
 
 if __name__ == "__main__":
     run()
