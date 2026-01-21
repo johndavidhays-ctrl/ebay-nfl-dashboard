@@ -4,16 +4,11 @@ from app.db import init_db, get_conn
 from app.ebay_auth import get_app_token
 from app.ebay_browse import browse_search
 
-SCANNER_VERSION = "SINGLES_ONLY_100_PROFIT_BIG_UPSIDE_UNDER_1000"
+SCANNER_VERSION = "SINGLES_ONLY_100_PROFIT_ACTIVE_PRUNE"
 
-# Singles only, no lots
 MIN_BUY_PRICE = 10.0
 MAX_BUY_PRICE = 1000.0
-
-# Only show big upside opportunities
 MIN_PROFIT = 100.0
-
-# Require estimated value to be at least 2x total cost
 UPSIDE_MULTIPLE = 2.0
 
 EBAY_FEE_RATE = 0.13
@@ -147,11 +142,53 @@ def compute_score(misprice: float, profit: float, roi: float, ltype: str) -> flo
     score += misprice * 1.4
     score += profit * 2.2
     score += roi * 30.0
-
     if ltype == "AUCTION":
         score += 30.0
-
     return round(score, 2)
+
+
+def mark_all_inactive(cur):
+    cur.execute("UPDATE deals SET active = FALSE;")
+
+
+def prune_inactive(cur):
+    cur.execute("DELETE FROM deals WHERE active = FALSE;")
+
+
+def upsert_active(cur, item_id, title, item_url, sold_comp_url, price, shipping, profit, roi, score, ltype):
+    cur.execute(
+        """
+        INSERT INTO deals (
+            item_id, title, item_url, sold_url, buy_price, buy_shipping,
+            est_profit, roi, score, listing_type, last_seen_at, active
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW(), TRUE)
+        ON CONFLICT (item_id) DO UPDATE SET
+            title = EXCLUDED.title,
+            item_url = EXCLUDED.item_url,
+            sold_url = EXCLUDED.sold_url,
+            buy_price = EXCLUDED.buy_price,
+            buy_shipping = EXCLUDED.buy_shipping,
+            est_profit = EXCLUDED.est_profit,
+            roi = EXCLUDED.roi,
+            score = EXCLUDED.score,
+            listing_type = EXCLUDED.listing_type,
+            last_seen_at = NOW(),
+            active = TRUE;
+        """,
+        (
+            str(item_id),
+            title,
+            str(item_url),
+            sold_comp_url,
+            round(price, 2),
+            round(shipping, 2),
+            round(profit, 2),
+            round(roi, 2),
+            score,
+            ltype,
+        ),
+    )
 
 
 def run():
@@ -162,105 +199,88 @@ def run():
 
     total_seen = 0
     total_kept = 0
-    total_inserted = 0
+    total_upserted = 0
 
-    for query in SEARCH_QUERIES:
-        print(f"SCANNER: query: {query}")
-        data = browse_search(token, query)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # 1) assume everything is gone until we see it again
+            mark_all_inactive(cur)
+            conn.commit()
 
-        if not isinstance(data, dict):
-            continue
+            # 2) scan and upsert what is currently active
+            for query in SEARCH_QUERIES:
+                print(f"SCANNER: query: {query}")
+                data = browse_search(token, query)
 
-        items = data.get("itemSummaries", [])
-        if not isinstance(items, list):
-            continue
+                if not isinstance(data, dict):
+                    continue
 
-        items = items[:MAX_ITEMS_PER_QUERY]
-        print(f"SCANNER: items returned: {len(items)}")
+                items = data.get("itemSummaries", [])
+                if not isinstance(items, list):
+                    continue
 
-        for item in items:
-            total_seen += 1
+                items = items[:MAX_ITEMS_PER_QUERY]
+                print(f"SCANNER: items returned: {len(items)}")
 
-            item_id = item.get("itemId")
-            title = item.get("title") or ""
-            item_url = item.get("itemWebUrl")
+                for item in items:
+                    total_seen += 1
 
-            if not item_id or not title or not item_url:
-                continue
+                    item_id = item.get("itemId")
+                    title = item.get("title") or ""
+                    item_url = item.get("itemWebUrl")
 
-            if looks_like_lot(title):
-                continue
+                    if not item_id or not title or not item_url:
+                        continue
 
-            price = extract_price(item)
-            shipping = extract_shipping(item)
+                    if looks_like_lot(title):
+                        continue
 
-            if price < MIN_BUY_PRICE or price > MAX_BUY_PRICE:
-                continue
+                    price = extract_price(item)
+                    shipping = extract_shipping(item)
 
-            est_value = estimate_value_from_title(title)
-            cost = price + shipping
+                    if price < MIN_BUY_PRICE or price > MAX_BUY_PRICE:
+                        continue
 
-            if not has_big_upside(est_value, cost):
-                continue
+                    est_value = estimate_value_from_title(title)
+                    cost = price + shipping
 
-            profit = estimate_profit(price, shipping, est_value)
-            if profit < MIN_PROFIT:
-                continue
+                    if not has_big_upside(est_value, cost):
+                        continue
 
-            roi = profit / cost if cost > 0 else 0.0
-            ltype = listing_type(item)
-            misprice = est_value - cost
-            score = compute_score(misprice, profit, roi, ltype)
+                    profit = estimate_profit(price, shipping, est_value)
+                    if profit < MIN_PROFIT:
+                        continue
 
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO deals (
-                            item_id,
-                            title,
-                            item_url,
-                            sold_url,
-                            buy_price,
-                            buy_shipping,
-                            est_profit,
-                            roi,
-                            score,
-                            listing_type
-                        )
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (item_id) DO UPDATE SET
-                            title = EXCLUDED.title,
-                            item_url = EXCLUDED.item_url,
-                            sold_url = EXCLUDED.sold_url,
-                            buy_price = EXCLUDED.buy_price,
-                            buy_shipping = EXCLUDED.buy_shipping,
-                            est_profit = EXCLUDED.est_profit,
-                            roi = EXCLUDED.roi,
-                            score = EXCLUDED.score,
-                            listing_type = EXCLUDED.listing_type
-                        """,
-                        (
-                            str(item_id),
-                            title,
-                            str(item_url),
-                            sold_url(title),
-                            round(price, 2),
-                            round(shipping, 2),
-                            round(profit, 2),
-                            round(roi, 2),
-                            score,
-                            ltype,
-                        ),
+                    roi = profit / cost if cost > 0 else 0.0
+                    ltype = listing_type(item)
+                    misprice = est_value - cost
+                    score = compute_score(misprice, profit, roi, ltype)
+
+                    upsert_active(
+                        cur,
+                        item_id=item_id,
+                        title=title,
+                        item_url=item_url,
+                        sold_comp_url=sold_url(title),
+                        price=price,
+                        shipping=shipping,
+                        profit=profit,
+                        roi=roi,
+                        score=score,
+                        ltype=ltype,
                     )
-                    conn.commit()
+                    total_upserted += 1
+                    total_kept += 1
 
-            total_inserted += 1
-            total_kept += 1
+                conn.commit()
+
+            # 3) remove anything not seen this run
+            prune_inactive(cur)
+            conn.commit()
 
     print(f"SCANNER: total_seen: {total_seen}")
     print(f"SCANNER: total_kept: {total_kept}")
-    print(f"SCANNER: total_inserted: {total_inserted}")
+    print(f"SCANNER: total_upserted: {total_upserted}")
 
 
 if __name__ == "__main__":
