@@ -1,77 +1,99 @@
 import os
 from datetime import datetime, timezone
-
-from sqlalchemy import (
-    create_engine,
-    text,
-)
+from sqlalchemy import create_engine, text
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 
-def _must_get_database_url() -> str:
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing in environment variables")
-    return DATABASE_URL
-
-
 def get_engine():
-    url = _must_get_database_url()
-    return create_engine(url, pool_pre_ping=True)
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not set")
+    return create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
 def init_db():
-    eng = get_engine()
-    with eng.begin() as conn:
-        conn.execute(text("CREATE TABLE IF NOT EXISTS deals (item_id TEXT UNIQUE)"))
-
-        row = conn.execute(
-            text(
-                """
-                SELECT 1
-                FROM information_schema.columns
-                WHERE table_name = 'deals' AND column_name = 'id'
-                LIMIT 1
-                """
-            )
-        ).fetchone()
-
-        if not row:
-            conn.execute(text("ALTER TABLE deals ADD COLUMN id BIGSERIAL"))
-            conn.execute(text("ALTER TABLE deals ADD PRIMARY KEY (id)"))
-
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS item_id TEXT"))
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS title TEXT"))
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS url TEXT"))
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS image_url TEXT"))
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS query TEXT"))
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS total_cost NUMERIC"))
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS market NUMERIC"))
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS profit NUMERIC"))
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS end_time TIMESTAMPTZ"))
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ"))
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ"))
-        conn.execute(text("ALTER TABLE deals ADD COLUMN IF NOT EXISTS is_active BOOLEAN"))
-
+    engine = get_engine()
+    with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_deals_item_id
-                ON deals (item_id)
+                CREATE TABLE IF NOT EXISTS deals (
+                    id BIGSERIAL PRIMARY KEY,
+                    item_id TEXT UNIQUE,
+                    title TEXT,
+                    url TEXT,
+                    image_url TEXT,
+                    query TEXT,
+                    total_cost NUMERIC,
+                    market NUMERIC,
+                    profit NUMERIC,
+                    end_time TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    is_active BOOLEAN DEFAULT TRUE
+                )
                 """
             )
         )
+    return engine
 
-        now = datetime.now(timezone.utc)
+
+def upsert_deal(engine, deal):
+    with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                UPDATE deals
-                SET is_active = false, updated_at = :now
-                WHERE is_active IS DISTINCT FROM false
+                INSERT INTO deals (
+                    item_id, title, url, image_url, query,
+                    total_cost, market, profit, end_time,
+                    updated_at, is_active
+                )
+                VALUES (
+                    :item_id, :title, :url, :image_url, :query,
+                    :total_cost, :market, :profit, :end_time,
+                    :updated_at, true
+                )
+                ON CONFLICT (item_id)
+                DO UPDATE SET
+                    title = EXCLUDED.title,
+                    url = EXCLUDED.url,
+                    image_url = EXCLUDED.image_url,
+                    query = EXCLUDED.query,
+                    total_cost = EXCLUDED.total_cost,
+                    market = EXCLUDED.market,
+                    profit = EXCLUDED.profit,
+                    end_time = EXCLUDED.end_time,
+                    updated_at = EXCLUDED.updated_at,
+                    is_active = true
                 """
             ),
-            {"now": now},
+            {
+                **deal,
+                "updated_at": datetime.now(timezone.utc),
+            },
         )
 
-    return eng
+
+def fetch_active_deals(engine):
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT
+                    id,
+                    item_id,
+                    title,
+                    url,
+                    image_url,
+                    query,
+                    total_cost,
+                    market,
+                    profit,
+                    end_time
+                FROM deals
+                WHERE is_active = true
+                ORDER BY end_time ASC
+                """
+            )
+        ).mappings().all()
+        return list(rows)
