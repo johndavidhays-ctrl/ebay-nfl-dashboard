@@ -1,161 +1,89 @@
-import os
 from datetime import datetime, timezone
-from typing import List, Dict, Any
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from sqlalchemy import select, text
+from sqlalchemy.orm import Session
 
-from .db import SessionLocal, ensure_schema, Item, DATABASE_URL
+from app.db import fetch_active_deals, init_db
+
 
 app = FastAPI()
+engine = init_db()
 
 
-@app.on_event("startup")
-def startup() -> None:
-    ensure_schema()
+def _utcnow():
+    return datetime.now(timezone.utc)
 
 
-@app.get("/debug")
-def debug() -> Dict[str, Any]:
-    ensure_schema()
-    db = SessionLocal()
-    try:
-        host_part = (DATABASE_URL or "").split("@")[-1].split("?")[0]
-        total = db.execute(text("select count(*) from items")).scalar() or 0
-        active = db.execute(text("select count(*) from items where active = true")).scalar() or 0
-        lanes = db.execute(text("select lane, count(*) from items group by lane")).fetchall()
-        return {
-            "db": host_part,
-            "total": int(total),
-            "active": int(active),
-            "lanes": {str(k): int(v) for k, v in lanes},
-        }
-    finally:
-        db.close()
+def _mins_away(dt):
+    if not dt:
+        return ""
+    delta = dt - _utcnow()
+    mins = int(delta.total_seconds() // 60)
+    return str(mins)
 
 
-@app.get("/items")
-def items() -> Dict[str, Any]:
-    ensure_schema()
-    db = SessionLocal()
-    try:
-        now = datetime.now(timezone.utc)
-
-        rows: List[Item] = db.scalars(
-            select(Item)
-            .where(Item.active.is_(True))
-            .order_by(Item.end_time.asc())
-        ).all()
-
-        out = []
-        for it in rows:
-            mins = None
-            if it.end_time:
-                mins = int((it.end_time - now).total_seconds() // 60)
-                if mins < 0:
-                    mins = 0
-
-            d = it.to_dict()
-            d["ends_minutes"] = mins
-            out.append(d)
-
-        return {"items": out}
-    finally:
-        db.close()
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 
-@app.get("/")
-def home() -> HTMLResponse:
-    return HTMLResponse(HTML)
+@app.get("/", response_class=HTMLResponse)
+def home():
+    with Session(engine) as session:
+        deals = fetch_active_deals(session, limit=250)
 
+    rows = []
+    for d in deals:
+        mins = _mins_away(d.end_time)
+        rows.append(
+            f"""
+            <tr>
+              <td style="width:220px;">
+                <div style="display:flex; gap:10px; align-items:flex-start;">
+                  <img src="{d.image_url}" style="width:120px; height:auto; border:1px solid #ddd;" />
+                  <div>
+                    <a href="{d.url}" target="_blank" rel="noreferrer">{d.title}</a>
+                    <div style="color:#666; font-size:12px;">{d.item_id}</div>
+                  </div>
+                </div>
+              </td>
+              <td style="white-space:nowrap;">USD {d.total_cost:.2f}</td>
+              <td style="white-space:nowrap;">USD {d.market:.2f}</td>
+              <td style="white-space:nowrap; font-weight:700;">USD {d.profit:.2f}</td>
+              <td style="white-space:nowrap;">{mins}</td>
+              <td style="white-space:nowrap; color:#666;">{d.query}</td>
+            </tr>
+            """
+        )
 
-HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Card Sniper Board</title>
-  <style>
-    body { font-family: Arial; margin: 20px; }
-    h1 { margin-bottom: 6px; }
-    .sub { color: #444; margin-bottom: 20px; }
-    h2 { margin-top: 28px; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
-    th { background: #f4f4f4; }
-    img { max-width: 90px; height: auto; display: block; }
-    .laneRaw { background: #fff3e0; }
-    .muted { color: #666; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <h1>Card Sniper Board</h1>
-  <div class="sub">Two lanes. Auction only. Singles only. Profit 150 plus. Sorted by ending soonest.</div>
-
-  <h2>Graded Locks</h2>
-  <table id="graded">
-    <tr>
-      <th>Card</th>
-      <th>Buy</th>
-      <th>Market</th>
-      <th>Profit</th>
-      <th>Ends</th>
-    </tr>
-  </table>
-
-  <h2>Raw Upside</h2>
-  <table id="raw">
-    <tr>
-      <th>Card</th>
-      <th>Buy</th>
-      <th>Market</th>
-      <th>Profit</th>
-      <th>Ends</th>
-    </tr>
-  </table>
-
-<script>
-function money(v) {
-  if (v === null || v === undefined) return '';
-  return '$' + Number(v).toFixed(2);
-}
-
-fetch('/items')
-  .then(r => r.json())
-  .then(data => {
-    const graded = document.getElementById('graded');
-    const raw = document.getElementById('raw');
-
-    (data.items || []).forEach(i => {
-      const cls = (i.lane === 'raw') ? 'laneRaw' : '';
-      const ends = (i.ends_minutes === null || i.ends_minutes === undefined) ? '' : (i.ends_minutes + ' min');
-
-      const row = document.createElement('tr');
-      row.className = cls;
-
-      row.innerHTML = `
-        <td>
-          <img src="${i.image_url || ''}" alt="">
-          <a href="${i.url || '#'}" target="_blank">${i.title || ''}</a>
-          <div class="muted">${i.lane === 'raw' ? 'Raw Upside' : 'Graded Lock'}</div>
-        </td>
-        <td>${money(i.total_price)}</td>
-        <td>${money(i.market_value)}</td>
-        <td><b>${money(i.profit)}</b></td>
-        <td>${ends}</td>
-      `;
-
-      if (i.lane === 'raw') raw.appendChild(row);
-      else graded.appendChild(row);
-    });
-  })
-  .catch(err => {
-    document.body.insertAdjacentHTML('beforeend', '<p style="color:red">Error loading items. Check /debug and Render logs.</p>');
-    console.error(err);
-  });
-</script>
-
-</body>
-</html>
-"""
+    html = f"""
+    <html>
+      <head>
+        <title>Auctions ending soon</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+      </head>
+      <body style="font-family:Arial, sans-serif; margin:20px;">
+        <h2>Auctions ending soon</h2>
+        <div style="color:#555; margin-bottom:12px;">
+          Sorted by nearest end time. Ends is minutes away.
+        </div>
+        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse; width:100%;">
+          <thead>
+            <tr>
+              <th align="left">Card</th>
+              <th align="left">Total</th>
+              <th align="left">Market</th>
+              <th align="left">Profit</th>
+              <th align="left">Ends</th>
+              <th align="left">Query</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(rows) if rows else '<tr><td colspan="6">No deals found yet</td></tr>'}
+          </tbody>
+        </table>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html)
