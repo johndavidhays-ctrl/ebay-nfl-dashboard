@@ -1,99 +1,72 @@
 import os
-from datetime import datetime, timezone
+from typing import Any, Dict, List
+
 from sqlalchemy import create_engine, text
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-
-def get_engine():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not set")
-    return create_engine(DATABASE_URL, pool_pre_ping=True)
+from sqlalchemy.engine import Engine
 
 
-def init_db():
+def _get_database_url() -> str:
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL is missing")
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return url
+
+
+def get_engine() -> Engine:
+    return create_engine(
+        _get_database_url(),
+        pool_pre_ping=True,
+        future=True,
+    )
+
+
+def init_db() -> None:
     engine = get_engine()
+    ddl = """
+    CREATE TABLE IF NOT EXISTS deals (
+        id BIGSERIAL PRIMARY KEY,
+        item_id TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        url TEXT NOT NULL,
+        image_url TEXT,
+        query TEXT,
+        total_cost NUMERIC,
+        market NUMERIC,
+        profit NUMERIC,
+        ends_at TIMESTAMPTZ,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """
     with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS deals (
-                    id BIGSERIAL PRIMARY KEY,
-                    item_id TEXT UNIQUE,
-                    title TEXT,
-                    url TEXT,
-                    image_url TEXT,
-                    query TEXT,
-                    total_cost NUMERIC,
-                    market NUMERIC,
-                    profit NUMERIC,
-                    end_time TIMESTAMPTZ,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW(),
-                    is_active BOOLEAN DEFAULT TRUE
-                )
-                """
-            )
-        )
-    return engine
+        conn.execute(text(ddl))
 
 
-def upsert_deal(engine, deal):
+def fetch_active_deals(limit: int = 200) -> List[Dict[str, Any]]:
+    engine = get_engine()
+    sql = """
+    SELECT
+        id,
+        item_id,
+        title,
+        url,
+        image_url,
+        query,
+        total_cost,
+        market,
+        profit,
+        ends_at,
+        is_active,
+        created_at,
+        updated_at
+    FROM deals
+    WHERE is_active = TRUE
+    ORDER BY ends_at ASC NULLS LAST
+    LIMIT :limit;
+    """
     with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                INSERT INTO deals (
-                    item_id, title, url, image_url, query,
-                    total_cost, market, profit, end_time,
-                    updated_at, is_active
-                )
-                VALUES (
-                    :item_id, :title, :url, :image_url, :query,
-                    :total_cost, :market, :profit, :end_time,
-                    :updated_at, true
-                )
-                ON CONFLICT (item_id)
-                DO UPDATE SET
-                    title = EXCLUDED.title,
-                    url = EXCLUDED.url,
-                    image_url = EXCLUDED.image_url,
-                    query = EXCLUDED.query,
-                    total_cost = EXCLUDED.total_cost,
-                    market = EXCLUDED.market,
-                    profit = EXCLUDED.profit,
-                    end_time = EXCLUDED.end_time,
-                    updated_at = EXCLUDED.updated_at,
-                    is_active = true
-                """
-            ),
-            {
-                **deal,
-                "updated_at": datetime.now(timezone.utc),
-            },
-        )
-
-
-def fetch_active_deals(engine):
-    with engine.begin() as conn:
-        rows = conn.execute(
-            text(
-                """
-                SELECT
-                    id,
-                    item_id,
-                    title,
-                    url,
-                    image_url,
-                    query,
-                    total_cost,
-                    market,
-                    profit,
-                    end_time
-                FROM deals
-                WHERE is_active = true
-                ORDER BY end_time ASC
-                """
-            )
-        ).mappings().all()
-        return list(rows)
+        rows = conn.execute(text(sql), {"limit": int(limit)}).mappings().all()
+        return [dict(r) for r in rows]
